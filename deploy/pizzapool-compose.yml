@@ -1,0 +1,47 @@
+services:
+  lidatube:
+    # Build the local smart-lidatube fork instead of pulling upstream :latest.
+    build:
+      context: /home/pizza/smart-lidatube
+    image: smart-lidatube:local
+    container_name: lidatube
+    env_file:
+      - /mnt/PizzaPool/Config/Lidatube/smart-lidatube.env
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      attempt_lidarr_import: "True"
+      thread_limit: "4"
+    ports:
+      - "5000:5000"
+    volumes:
+      - /mnt/PizzaPool/Config/Lidatube:/lidatube/config
+      - /mnt/PizzaPool/MediaServer/Music2:/lidatube/downloads
+      - /etc/localtime:/etc/localtime:ro
+    restart: unless-stopped
+
+  # Run exactly one. It polls Navidrome, handles Retry jobs, and polls Telegram.
+  smart-worker:
+    image: smart-lidatube:local
+    container_name: smart-lidatube-worker
+    depends_on:
+      lidatube:
+        condition: service_started
+    env_file:
+      - /mnt/PizzaPool/Config/Lidatube/smart-lidatube.env
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      SMART_WORKER: "true"
+      DOWNLOADS_ROOT: /lidatube/downloads
+    volumes:
+      - /mnt/PizzaPool/Config/Lidatube:/lidatube/config
+      - /mnt/PizzaPool/MediaServer/Music2:/lidatube/downloads
+      - /etc/localtime:/etc/localtime:ro
+    healthcheck:
+      test: ["CMD", "python", "-m", "smart_lidatube.healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    restart: unless-stopped
