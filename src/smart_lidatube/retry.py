@@ -45,7 +45,7 @@ class PlaylistPoller:
                 f"navidrome:{entry['playlist_id']}:{entry['playlist_index']}:"
                 f"{entry.get('id')}:{entry.get('path', '')}"
             )
-            job = self.store.enqueue_job(
+            job, _created = self.store.enqueue_occurrence(
                 track_id,
                 key,
                 "manual" if entry["playlist_name"] == "Manual Retry" else "auto",
@@ -57,13 +57,20 @@ class PlaylistPoller:
                 removed = self.navidrome.remove_entry(
                     entry["playlist_id"],
                     entry["playlist_index"],
-                    expected_id=entry.get("id"),
+                    expected=entry,
                 )
             except TypeError:
                 # Compatibility with existing injected/simple clients.
-                removed = self.navidrome.remove_entry(
-                    entry["playlist_id"], entry["playlist_index"]
-                )
+                try:
+                    removed = self.navidrome.remove_entry(
+                        entry["playlist_id"], entry["playlist_index"],
+                        expected_id=entry.get("id")
+                    )
+                except TypeError:
+                    removed = self.navidrome.remove_entry(
+                        entry["playlist_id"], entry["playlist_index"]
+                    )
             if removed is not False:
+                self.store.consume_occurrence(job)
                 queued.append(job)
         return queued

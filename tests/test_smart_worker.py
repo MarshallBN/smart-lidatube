@@ -140,8 +140,8 @@ def test_worker_rejects_mismatch_then_imports_match(tmp_path):
     worker = JobWorker(store, lidarr, Sources(), Verifier(), tmp_path)
     assert worker.process_once() == job_id
     assert store.is_rejected(7, "youtube", "bad")
-    assert store.get_job(job_id)["status"] == "completed"
-    assert ".smart-staging" in lidarr.imported
+    assert store.get_job(job_id)["status"] == "importing"
+    assert ".smart-staging" in str(lidarr.imported)
     assert len(store.list_attempts(job_id)) == 2
 
 

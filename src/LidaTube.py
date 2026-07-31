@@ -305,7 +305,7 @@ class DataHandler:
                 "additionalFile": False,
                 # Lidarr owns final naming/sorting. Smart replacements are staged
                 # below /lidatube/downloads and imported before any explicit delete.
-                "replaceExistingFiles": True,
+                "replaceExistingFiles": False,
                 "disableReleaseSwitching": False,
                 "rejections": [],
             }

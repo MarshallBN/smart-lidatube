@@ -1,6 +1,8 @@
 """HTTP and media-source clients used by the smart worker."""
 
 from pathlib import Path, PurePosixPath
+from copy import deepcopy
+from uuid import uuid4
 
 import requests
 import yt_dlp
@@ -8,11 +10,14 @@ from ytmusicapi import YTMusic
 
 
 class LidarrClient:
-    def __init__(self, base_url, api_key, session=requests, timeout=30):
+    def __init__(self, base_url, api_key, session=requests, timeout=30,
+                 navidrome_music_root=None, lidarr_music_root=None):
         self.base = base_url.rstrip("/")
         self.session = session
         self.timeout = timeout
         self.headers = {"X-Api-Key": api_key}
+        self.navidrome_music_root = navidrome_music_root
+        self.lidarr_music_root = lidarr_music_root
 
     def _get(self, endpoint, **params):
         response = self.session.get(
@@ -48,9 +53,23 @@ class LidarrClient:
 
     def resolve_track_by_path(self, song_path):
         """Resolve a Navidrome path without relying on its database IDs."""
-        wanted = PurePosixPath(str(song_path).replace("\\", "/"))
-        files = self._records(self._get("trackfile", pageSize=100000))
-        match = None
+        raw = str(song_path).replace("\\", "/")
+        if self.navidrome_music_root and self.lidarr_music_root:
+            try:
+                relative = PurePosixPath(raw).relative_to(PurePosixPath(self.navidrome_music_root))
+                raw = str(PurePosixPath(self.lidarr_music_root) / relative)
+            except ValueError:
+                return None
+        wanted = PurePosixPath(raw)
+        files = []
+        page = 1
+        while True:
+            payload = self._get("trackfile", page=page, pageSize=250)
+            files.extend(self._records(payload))
+            if not isinstance(payload, dict) or len(files) >= payload.get("totalRecords", len(files)):
+                break
+            page += 1
+        matches = []
         for track_file in files:
             candidate = PurePosixPath(str(track_file.get("path", "")).replace("\\", "/"))
             candidate_parts = candidate.parts
@@ -58,10 +77,10 @@ class LidarrClient:
                 len(candidate_parts) >= len(wanted.parts)
                 and candidate_parts[-len(wanted.parts) :] == wanted.parts
             ):
-                match = track_file
-                break
-        if not match:
+                matches.append(track_file)
+        if len(matches) != 1:
             return None
+        match = matches[0]
         file_id = match.get("id")
         tracks = self._records(self._get("track", trackFileId=file_id))
         for track in tracks:
@@ -127,7 +146,16 @@ class LidarrClient:
         return selected.get("id") if selected else None
 
     def manual_import(self, path, track):
-        body = {
+        required = {"id": track.get("id"), "artistId": track.get("artistId"),
+                    "albumId": track.get("albumId"), "albumReleaseId": self._release_id(track)}
+        if any(value in (None, "") for value in required.values()):
+            raise ValueError("manual import requires track, artist, album and release IDs")
+        try:
+            discovered = self._records(self._get("manualimport", folder=str(Path(path).parent), filterExistingFiles=False))
+        except Exception:
+            discovered = []  # Compatibility fallback for unsupported Lidarr versions.
+        selected = next((item for item in discovered if PurePosixPath(str(item.get("path", ""))) == PurePosixPath(str(path))), None)
+        body = deepcopy(selected) if selected else {
             "id": track["id"],
             "path": str(path),
             "name": track.get("title", ""),
@@ -143,6 +171,10 @@ class LidarrClient:
             "disableReleaseSwitching": False,
             "rejections": [],
         }
+        body.update({"id": track["id"], "trackIds": [track["id"]], "path": str(path),
+                     "name": track.get("title", ""), **required,
+                     "replaceExistingFiles": True, "disableReleaseSwitching": False,
+                     "rejections": []})
         response = self.session.post(
             f"{self.base}/api/v1/manualimport",
             json=[body],
@@ -211,14 +243,16 @@ class NavidromeClient:
             )
         return output
 
-    def remove_entry(self, playlist_id, index, expected_id=None):
-        if expected_id is not None:
+    def remove_entry(self, playlist_id, index, expected_id=None, expected=None):
+        expected = expected or ({"id": expected_id} if expected_id is not None else None)
+        if expected is not None:
             entries = (
                 self._call("getPlaylist", id=playlist_id)
                 .get("playlist", {})
                 .get("entry", [])
             )
-            if index >= len(entries) or str(entries[index].get("id")) != str(expected_id):
+            fields = ("id", "path", "title", "artist", "album")
+            if index >= len(entries) or any(str(entries[index].get(key, "")) != str(expected.get(key, "")) for key in fields if key in expected):
                 return False
         self._call(
             "updatePlaylist", playlistId=playlist_id, songIndexToRemove=index
@@ -260,7 +294,7 @@ class YouTubeClient:
         return candidates
 
     def download(self, candidate, directory):
-        directory = Path(directory)
+        directory = Path(directory) / f"attempt-{uuid4().hex}"
         directory.mkdir(parents=True, exist_ok=True)
         template = str(directory / f"{candidate['source_id']}.%(ext)s")
         options = {
@@ -279,8 +313,11 @@ class YouTubeClient:
         if self.cookies:
             options["cookiefile"] = self.cookies
         with self.ydl_factory(options) as downloader:
-            downloader.extract_info(candidate["url"], download=True)
-        matches = sorted(directory.glob(f"{candidate['source_id']}.*"))
+            info = downloader.extract_info(candidate["url"], download=True)
+        reported = [Path(item["filepath"]) for item in (info or {}).get("requested_downloads", []) if item.get("filepath")]
+        audio_ext = {".m4a", ".mp3", ".flac", ".ogg", ".opus", ".wav", ".aac", ".webm"}
+        matches = [item for item in reported + sorted(directory.glob(f"{candidate['source_id']}.*"))
+                   if item.suffix.lower() in audio_ext and item.is_file() and item.stat().st_size > 0]
         if not matches:
             raise RuntimeError("yt-dlp completed without producing an audio file")
         return matches[0]

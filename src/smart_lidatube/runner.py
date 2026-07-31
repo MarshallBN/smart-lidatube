@@ -37,6 +37,8 @@ def build_components():
         env("LIDARR_ADDRESS", "http://lidarr:8686", "lidarr_address"),
         env("LIDARR_API_KEY", legacy="lidarr_api_key"),
         timeout=float(env("LIDARR_API_TIMEOUT", "30", "lidarr_api_timeout")),
+        navidrome_music_root=env("NAVIDROME_MUSIC_ROOT") or None,
+        lidarr_music_root=env("LIDARR_MUSIC_ROOT") or None,
     )
     telegram = None
     token = env("TELEGRAM_BOT_TOKEN")
@@ -57,6 +59,7 @@ def build_components():
         source,
         verifier,
         env("DOWNLOADS_ROOT", "/lidatube/downloads"),
+        lidarr_downloads_root=env("LIDARR_DOWNLOADS_ROOT", "/lidatube/downloads"),
         telegram=telegram,
         review_chat_id=int(env("TELEGRAM_REVIEW_CHAT_ID", "0")) or (
             min(chats) if chats else None
@@ -84,6 +87,9 @@ def run_forever():
     interval = float(env("SMART_POLL_INTERVAL", "10"))
     while True:
         try:
+            worker.store.set_setting("worker_heartbeat", str(time.time()))
+            worker.store.recover_stale(int(env("SMART_CLAIM_TIMEOUT", "300")))
+            worker.reconcile_imports()
             if poller:
                 poller.poll_once()
             while worker.process_once() is not None:

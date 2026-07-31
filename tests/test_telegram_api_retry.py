@@ -13,6 +13,7 @@ def test_track_scoped_candidate_filter_and_staging(tmp_path):
 
 def test_telegram_callbacks_use_attempt_id_and_fail_closed(tmp_path):
     s=Store(tmp_path/"x.db"); j=s.enqueue_job(1,"x"); a=s.add_attempt(j,"youtube","abc")
+    s.update_attempt(a, verdict="awaiting_review"); s.update_job(j, "awaiting_review")
     sent=[]
     bot=TelegramBot("token", s, allowed_users={5}, allowed_chats={9}, request=lambda method,payload: sent.append((method,payload)) or {})
     bot.send_review(9,a,"candidate")

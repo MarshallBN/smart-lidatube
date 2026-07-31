@@ -73,6 +73,8 @@ class AcoustIDClient:
         self._last_request = None
 
     def lookup(self, fingerprint, duration):
+        if not self.api_key:
+            raise FingerprintError("acoustid_disabled")
         if self._last_request is not None:
             delay = self.min_interval - (self.clock() - self._last_request)
             if delay > 0:
@@ -80,7 +82,10 @@ class AcoustIDClient:
         response = self._post(fingerprint, duration)
         self._last_request = self.clock()
         if getattr(response, "status_code", None) == 429:
-            retry_after = float(getattr(response, "headers", {}).get("Retry-After", 1))
+            try:
+                retry_after = float(getattr(response, "headers", {}).get("Retry-After", 1))
+            except (TypeError, ValueError):
+                retry_after = 1
             self.sleep(max(retry_after, self.min_interval))
             response = self._post(fingerprint, duration)
             self._last_request = self.clock()
@@ -182,10 +187,13 @@ class FileVerifier:
                 fingerprint.fingerprint, fingerprint.duration
             )
             error = None
-        except requests.RequestException as exc:
+        except FingerprintError as exc:
             lookup = None
             error = str(exc)
-        return self.policy.verify(
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            lookup = None
+            error = str(exc)
+        result = self.policy.verify(
             lookup,
             identity.get("recording_id"),
             identity.get("duration"),
@@ -193,3 +201,6 @@ class FileVerifier:
             error=error,
             partial=fingerprint.partial,
         )
+        if error == "acoustid_disabled":
+            return Verification("inconclusive", "acoustid_disabled", result.evidence)
+        return result

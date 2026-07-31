@@ -15,6 +15,10 @@ services:
     env_file: .env
     environment:
       SMART_WORKER: "true"
+      DOWNLOADS_ROOT: /lidatube/downloads
+      # Path to this same host volume from Lidarr's container (no Lidarr service
+      # or mount is required in this example).
+      LIDARR_DOWNLOADS_ROOT: /lidatube/downloads
     volumes:
       - ./config:/lidatube/config
       - /data/media/lidatube:/lidatube/downloads

@@ -19,7 +19,8 @@ class TelegramBot:
         self.allowed_chats = {int(value) for value in allowed_chats}
         self.timeout = timeout
         self.request = request or self._request
-        self.offset = None
+        saved = self.store.get_setting("telegram_update_offset")
+        self.offset = int(saved) if saved is not None else None
 
     def _request(self, method, payload):
         response = requests.post(
@@ -77,30 +78,16 @@ class TelegramBot:
             attempt_id = int(raw_id)
         except (KeyError, ValueError):
             return False
-        attempt = self.store.get_attempt(attempt_id)
         if prefix != "attempt" or action not in ("accept", "reject", "cancel"):
             return False
-        if not attempt:
-            return False
-        job = self.store.get_job(attempt["job_id"])
         evidence = {"telegram_user_id": user, "telegram_chat_id": chat}
-        if action == "accept":
-            self.store.set_attempt_verdict(attempt_id, "manual_accepted", evidence)
-            self.store.update_job(job["id"], "ready_import")
-        elif action == "reject":
-            self.store.set_attempt_verdict(attempt_id, "manual_rejected", evidence)
-            self.store.reject(
-                job["lidarr_track_id"],
-                attempt["provider"],
-                attempt["source_id"],
-                attempt_id,
-            )
-            self.store.update_job(job["id"], "queued")
-        else:
-            self.store.set_attempt_verdict(attempt_id, "cancelled", evidence)
-            self.store.update_job(job["id"], "cancelled")
-        self.request("answerCallbackQuery", {"callback_query_id": query["id"]})
-        return True
+        accepted = self.store.apply_review(attempt_id, action, evidence)
+        text = ("Review accepted." if accepted is not None else
+                "This review was already handled or is stale.")
+        self.request("answerCallbackQuery", {
+            "callback_query_id": query["id"], "text": text
+        })
+        return accepted is not None
 
     def poll_once(self, offset=None):
         requested_offset = self.offset if offset is None else offset
@@ -114,4 +101,5 @@ class TelegramBot:
             update_id = update.get("update_id")
             if update_id is not None:
                 self.offset = max(self.offset or 0, int(update_id) + 1)
+                self.store.set_setting("telegram_update_offset", self.offset)
         return updates
