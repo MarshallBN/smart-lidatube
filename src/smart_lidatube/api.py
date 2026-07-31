@@ -2,8 +2,7 @@ from functools import wraps
 from flask import Flask,request,jsonify
 
 
-def create_api(store,token):
-    app=Flask(__name__)
+def register_api(app, store, token):
     def auth(fn):
         @wraps(fn)
         def wrapped(*args,**kwargs):
@@ -23,3 +22,7 @@ def create_api(store,token):
     @app.get("/health")
     def health(): return jsonify(status="ok")
     return app
+
+
+def create_api(store,token):
+    return register_api(Flask(__name__), store, token)

@@ -9,6 +9,8 @@ import youtubesearchpython
 from ytmusicapi import YTMusic
 from flask import Flask, render_template
 from flask_socketio import SocketIO
+from smart_lidatube.api import register_api
+from smart_lidatube.store import Store
 import yt_dlp
 import concurrent.futures
 import re
@@ -301,7 +303,9 @@ class DataHandler:
                 "indexerFlags": 0,
                 "downloadId": "",
                 "additionalFile": False,
-                "replaceExistingFiles": False,
+                # Lidarr owns final naming/sorting. Smart replacements are staged
+                # below /lidatube/downloads and imported before any explicit delete.
+                "replaceExistingFiles": True,
                 "disableReleaseSwitching": False,
                 "rejections": [],
             }
@@ -772,6 +776,8 @@ class DataHandler:
 
 app = Flask(__name__)
 app.secret_key = "secret_key"
+smart_store = Store(os.environ.get("SMART_DB_PATH", "/lidatube/config/smart-lidatube.db"))
+register_api(app, smart_store, os.environ.get("SMART_API_TOKEN", ""))
 socketio = SocketIO(app)
 data_handler = DataHandler()
 

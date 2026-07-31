@@ -1,7 +1,7 @@
 from smart_lidatube.store import Store
 from smart_lidatube.telegram import TelegramBot
 from smart_lidatube.api import create_api
-from smart_lidatube.retry import filter_candidates, staging_path
+from smart_lidatube.retry import filter_candidates, staging_path, PlaylistPoller
 
 
 def test_track_scoped_candidate_filter_and_staging(tmp_path):
@@ -20,6 +20,16 @@ def test_telegram_callbacks_use_attempt_id_and_fail_closed(tmp_path):
     assert callback == f"attempt:{a}:accept" and "abc" not in callback
     assert bot.handle_callback({"id":"c","from":{"id":6},"message":{"chat":{"id":9}},"data":callback}) is False
     assert bot.handle_callback({"id":"c","from":{"id":5},"message":{"chat":{"id":9}},"data":callback}) is True
+
+
+def test_playlist_removes_only_after_durable_enqueue(tmp_path):
+    class Nav:
+        def retry_entries(self): return [{"id":"song","playlist_id":"p","playlist_name":"Retry","playlist_index":0,"path":"A/S.mp3"}]
+        def remove_entry(self,p,i): self.removed=(p,i)
+    nav=Nav(); s=Store(tmp_path/"x.db")
+    jobs=PlaylistPoller(nav,s,lambda entry: 77).poll_once()
+    assert s.get_job(jobs[0])["lidarr_track_id"] == 77
+    assert nav.removed == ("p",0)
 
 
 def test_token_authenticated_retry_api(tmp_path):

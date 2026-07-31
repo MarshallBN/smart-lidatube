@@ -1,0 +1,10 @@
+services:
+  lidatube:
+    build: .
+    env_file: .env
+    volumes:
+      - ./config:/lidatube/config
+      # This same host path must be visible to Lidarr at the path configured above.
+      - /data/media/lidatube:/lidatube/downloads
+    ports: ["5000:5000"]
+    restart: unless-stopped
