@@ -42,6 +42,14 @@ class JobWorker:
             return
 
         identity = self.lidarr.track_identity(track)
+        track_file_id = identity.get("track_file_id")
+        if track_file_id:
+            try:
+                identity["current_track_file"] = self.lidarr.get_track_file(
+                    track_file_id
+                )
+            except Exception as exc:
+                identity["current_track_file_error"] = str(exc)
         candidates = self.sources.search(identity["artist"], identity["title"])
         candidates = filter_candidates(
             self.store, job["lidarr_track_id"], candidates
