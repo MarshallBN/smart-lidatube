@@ -39,3 +39,21 @@ def test_token_authenticated_retry_api(tmp_path):
     assert response.status_code == 202
     job=response.get_json()["job_id"]
     assert client.get(f"/api/smart/jobs/{job}",headers={"Authorization":"Bearer secret"}).status_code == 200
+
+
+def test_retry_api_validates_mode_and_supports_optional_idempotency(tmp_path):
+    s = Store(tmp_path / "x.db")
+    client = create_api(s, "secret").test_client()
+    headers = {"Authorization": "Bearer secret"}
+    assert client.post(
+        "/api/smart/retry/22", json={"mode": "bad"}, headers=headers
+    ).status_code == 400
+    first = client.post(
+        "/api/smart/retry/22", headers={**headers, "Idempotency-Key": "request-1"}
+    ).get_json()["job_id"]
+    second = client.post(
+        "/api/smart/retry/22", headers={**headers, "Idempotency-Key": "request-1"}
+    ).get_json()["job_id"]
+    fresh = client.post("/api/smart/retry/22", headers=headers).get_json()["job_id"]
+    assert first == second
+    assert fresh != first

@@ -29,7 +29,8 @@ def test_acoustid_request_and_policy_uncertainty():
     seen = {}
     def post(url, **kwargs): seen.update(url=url, **kwargs); return Response()
     lookup = AcoustIDClient("key", post=post).lookup("fp", 200.6)
-    assert seen["data"]["duration"] == 201 and seen["data"]["meta"] == "recordingids"
+    assert seen["data"]["duration"] == 201
+    assert seen["data"]["meta"] == "recordingids sources"
     policy = VerificationPolicy(min_score=.8, duration_tolerance=8)
     assert policy.verify(lookup, "mb-good", 200, 201).verdict == "accepted"
     assert policy.verify({"results":[]}, "mb-good", 200, 201).verdict == "inconclusive"
