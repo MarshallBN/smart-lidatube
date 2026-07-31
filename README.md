@@ -69,18 +69,20 @@ https://hub.docker.com/r/thewicklowwolf/lidatube
 
 ## Smart retry MVP
 
-The smart fork adds durable SQLite retry jobs, track-scoped YouTube rejection history, Chromaprint/AcoustID verification, Navidrome playlist ingestion, Telegram review, and token-authenticated retry/status endpoints. Copy `.env.example` and use `docker-compose.smart.example.yml` as a starting point.
+The smart fork implements a separate autonomous worker, durable SQLite jobs and attempts, track-scoped YouTube rejection history, yt-dlp/YTMusic acquisition, Chromaprint/AcoustID verification, Navidrome playlist ingestion, Telegram review, and authenticated retry/status endpoints. Copy `.env.example` and use `docker-compose.smart.example.yml`; run exactly one `smart-worker` sidecar, never one poller per Gunicorn process.
 
-### Import ownership and migration
+### Lifecycle and import ownership
 
-`/lidatube/downloads` must map to a location visible to Lidarr. Replacement candidates are staged beneath `/lidatube/downloads/.smart-staging/<job>/` and submitted to Lidarr `/api/v1/manualimport` with `replaceExistingFiles=true`. **Lidarr remains the only component that names, moves, sorts, or replaces final library files.** The normal flow imports first and does not delete the current file. The explicit DELETE client method is only for operator-controlled recovery if a running Lidarr cannot replace on import. Existing missing-track behavior remains supported.
+The worker atomically claims jobs, resolves current Lidarr track identity (including MusicBrainz recording ID and duration), searches candidates, downloads into `/lidatube/downloads/.smart-staging/<job>/`, stores verification evidence, skips only rejections for the target track, and sends uncertain/manual candidates for Telegram review. Accept resumes the worker for import; reject searches the next candidate; cancel stops the job.
 
-The SQLite database is created automatically at `SMART_DB_PATH`; back it up with the config volume. Navidrome `Retry` and `Manual Retry` are regular playlists. `PlaylistPoller.poll_once()` is deliberately a separate scheduler/sidecar primitive to avoid duplicate Gunicorn workers. It durably creates an idempotent job before removing a successful queue entry.
+The downloads mount must be visible to Lidarr at the same configured path. Accepted files are submitted to Lidarr `/api/v1/manualimport` with `replaceExistingFiles=true`. **Lidarr alone names, moves, sorts, and replaces final library files.** Smart retry does not overwrite or pre-delete the existing file. Existing missing-track UI behavior remains supported.
 
-### Verification and security
+The SQLite database is created/migrated at `SMART_DB_PATH` with WAL and busy-timeout concurrency settings; back it up with the config volume. Navidrome `Retry` and `Manual Retry` are normal playlists. Entries are durably enqueued before removal, removals run in descending index order, and the occurrence is refetched/verified before deletion.
 
-The verifier invokes `fpcalc -json -length 120 FILE` without a shell. AcoustID network errors/no-match, low scores, absent expected MusicBrainz recording IDs, and ambiguity are inconclusive rather than definitely wrong. Strong duration or recording-ID mismatches are rejected.
+### Verification, API, and security
 
-Set a long random `SMART_API_TOKEN`. Use `Authorization: Bearer TOKEN` with `POST /api/smart/retry/<lidarr-track-id>` and `GET /api/smart/jobs/<id>`; an empty token fails closed. Telegram callbacks carry database attempt IDs only and must pass both user and chat allowlists. Keep credentials out of Git and expose APIs through HTTPS/trusted networks.
+The verifier invokes `fpcalc -json -length 120 FILE` without a shell. Exit 3 is retained as cautious partial evidence; empty fingerprints fail. AcoustID lookup requests `recordingids sources`, rate-limits locally, retries HTTP 429 once, and never submits fingerprints. Network/no-match, low score, absent expected ID, partial evidence, and ambiguity require review; strong duration/recording mismatches are automatically rejected.
 
-This MVP has mocked integration tests; it has not been validated against a user's live Lidarr, Navidrome, AcoustID, YouTube, or Telegram services.
+Set a long random `SMART_API_TOKEN`. Use the header **Authorization: Bearer TOKEN** with `POST /api/smart/retry/<lidarr-track-id>` and `GET /api/smart/jobs/<id>`; an empty token fails closed. Modes are `auto` or `manual`. Retry POSTs are new requests by default; provide `Idempotency-Key` (or JSON `idempotency_key`) for safe replay. Telegram callbacks contain attempt IDs only and require both user and chat allowlists.
+
+Uppercase smart variables and lowercase legacy Lidarr variables are accepted by the sidecar. This MVP is covered by mocked behavioral/integration tests and a container health smoke test where Docker is available. It has **not** been validated against live Lidarr, Navidrome, AcoustID, YouTube, or Telegram services; API payload/version differences may require field adaptation.

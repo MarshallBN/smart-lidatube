@@ -4,7 +4,18 @@ services:
     env_file: .env
     volumes:
       - ./config:/lidatube/config
-      # This same host path must be visible to Lidarr at the path configured above.
+      # This same host path must be visible to Lidarr.
       - /data/media/lidatube:/lidatube/downloads
     ports: ["5000:5000"]
+    restart: unless-stopped
+
+  # One sidecar only: do not run the poller in each Gunicorn web worker.
+  smart-worker:
+    build: .
+    env_file: .env
+    environment:
+      SMART_WORKER: "true"
+    volumes:
+      - ./config:/lidatube/config
+      - /data/media/lidatube:/lidatube/downloads
     restart: unless-stopped

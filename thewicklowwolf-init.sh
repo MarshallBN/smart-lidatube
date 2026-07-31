@@ -58,4 +58,7 @@ export XDG_CACHE_HOME=/lidatube/cache
 
 # Start the application with the specified user permissions
 echo "Running LidaTube..."
+if [ "${SMART_WORKER:-false}" = "true" ]; then
+    exec su-exec ${PUID}:${PGID} python -m smart_lidatube.runner
+fi
 exec su-exec ${PUID}:${PGID} gunicorn src.LidaTube:app -c gunicorn_config.py
