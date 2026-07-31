@@ -64,6 +64,11 @@ def build_components():
         review_chat_id=int(env("TELEGRAM_REVIEW_CHAT_ID", "0")) or (
             min(chats) if chats else None
         ),
+        lease_seconds=int(env("SMART_CLAIM_TIMEOUT", "300")),
+        retry_delay=int(env("SMART_RETRY_DELAY", "30")),
+        max_attempts=int(env("SMART_MAX_ATTEMPTS", "5")),
+        import_verify_interval=float(env("SMART_IMPORT_VERIFY_INTERVAL", "10")),
+        import_verify_timeout=float(env("SMART_IMPORT_VERIFY_TIMEOUT", "900")),
     )
     poller = None
     nav_url = env("NAVIDROME_URL")
@@ -88,8 +93,10 @@ def run_forever():
     while True:
         try:
             worker.store.set_setting("worker_heartbeat", str(time.time()))
-            worker.store.recover_stale(int(env("SMART_CLAIM_TIMEOUT", "300")))
+            worker.store.set_setting("worker_status", "running")
+            worker.store.recover_stale(worker.lease_seconds)
             worker.reconcile_imports()
+            worker.retry_notifications()
             if poller:
                 poller.poll_once()
             while worker.process_once() is not None:

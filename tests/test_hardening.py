@@ -92,7 +92,7 @@ def test_import_submission_is_resumable_and_verified_before_cleanup(tmp_path):
         def get_track(self,_): return {"id":7,"trackFileId":self.file_id,"artistId":2,"albumId":3,"albumReleaseId":4}
         def track_identity(self,t): return {"track_file_id":t.get("trackFileId"),"artist":"A","title":"S"}
         def manual_import(self,path,track): self.posts+=1; assert str(path).startswith("/visible/"); return {"status":"queued"}
-    lid=Lidarr(); worker=JobWorker(store,lid,None,None,tmp_path/"downloads",lidarr_downloads_root="/visible")
+    lid=Lidarr(); worker=JobWorker(store,lid,None,None,tmp_path/"downloads",lidarr_downloads_root="/visible",import_verify_interval=0)
     assert worker.process_once()==job
     assert store.get_job(job)["status"] == "importing" and lid.posts == 1 and staged.exists()
     assert worker.process_once() is None  # importing is reconciled separately, never submitted twice

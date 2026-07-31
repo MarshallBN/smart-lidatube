@@ -22,4 +22,11 @@ services:
     volumes:
       - ./config:/lidatube/config
       - /data/media/lidatube:/lidatube/downloads
+    # Override the image's web HTTP probe: this process has no HTTP server.
+    healthcheck:
+      test: ["CMD", "python", "-m", "smart_lidatube.healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
     restart: unless-stopped

@@ -24,7 +24,17 @@ class Store:
             CREATE UNIQUE INDEX IF NOT EXISTS active_occurrence ON ingestion_occurrences(occurrence_key) WHERE consumed_at IS NULL;
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             """)
-            self._add_columns(c,"retry_jobs",{"updated_at":"TEXT","last_error":"TEXT","claimed_at":"TEXT","claim_token":"TEXT","retry_count":"INTEGER NOT NULL DEFAULT 0","next_attempt_at":"TEXT","prior_track_file_id":"INTEGER","submitted_path":"TEXT","import_result":"TEXT","import_started_at":"TEXT"})
+            self._add_columns(c, "retry_jobs", {
+                "updated_at": "TEXT", "last_error": "TEXT", "claimed_at": "TEXT",
+                "claim_token": "TEXT", "retry_count": "INTEGER NOT NULL DEFAULT 0",
+                "next_attempt_at": "TEXT", "prior_track_file_id": "INTEGER",
+                "submitted_path": "TEXT", "import_result": "TEXT",
+                "import_started_at": "TEXT", "import_phase": "TEXT",
+                "import_prepared_at": "TEXT", "import_submitted_at": "TEXT",
+                "import_checked_at": "TEXT", "notification_attempt_id": "INTEGER",
+                "notification_chat_id": "INTEGER", "notification_text": "TEXT",
+                "notification_evidence": "TEXT",
+            })
             self._add_columns(c,"source_attempts",{"staged_path":"TEXT","updated_at":"TEXT"})
             # Repoint rejection FKs to the survivor before deleting legacy duplicates.
             c.execute("""UPDATE source_rejections SET attempt_id=(SELECT MIN(a2.id) FROM source_attempts a1 JOIN source_attempts a2 ON a2.job_id=a1.job_id AND a2.provider=a1.provider AND a2.source_id=a1.source_id WHERE a1.id=source_rejections.attempt_id) WHERE attempt_id IS NOT NULL""")
@@ -77,8 +87,38 @@ class Store:
             status="failed" if count>=max_attempts else "queued"
             c.execute("UPDATE retry_jobs SET status=?,retry_count=?,next_attempt_at=datetime('now',?),last_error=?,claim_token=NULL,claimed_at=NULL WHERE id=?",(status,count,f"+{int(delay)} seconds",error,job_id))
 
-    def begin_import(self,job_id,prior_file_id,path,result):
-        with self._connect() as c:c.execute("UPDATE retry_jobs SET status='importing',prior_track_file_id=?,submitted_path=?,import_result=?,import_started_at=CURRENT_TIMESTAMP,claim_token=NULL,claimed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",(prior_file_id,str(path),json.dumps(result),job_id))
+    def prepare_import(self, job_id, prior_file_id, path):
+        with self._connect() as c:
+            c.execute(
+                """UPDATE retry_jobs SET status='importing',import_phase='prepared',
+                prior_track_file_id=?,submitted_path=?,import_result=NULL,
+                import_started_at=CURRENT_TIMESTAMP,import_prepared_at=CURRENT_TIMESTAMP,
+                import_submitted_at=NULL,import_checked_at=NULL,claim_token=NULL,
+                claimed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (prior_file_id, str(path), job_id),
+            )
+
+    def mark_import_submitted(self, job_id, result):
+        with self._connect() as c:
+            c.execute(
+                """UPDATE retry_jobs SET import_phase='submitted',import_result=?,
+                import_submitted_at=CURRENT_TIMESTAMP,import_checked_at=NULL,
+                updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='importing'
+                AND import_phase='prepared'""",
+                (json.dumps(result), job_id),
+            )
+
+    def mark_import_checked(self, job_id):
+        with self._connect() as c:
+            c.execute(
+                "UPDATE retry_jobs SET import_checked_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (job_id,),
+            )
+
+    def begin_import(self, job_id, prior_file_id, path, result):
+        """Backward-compatible helper that records an already submitted import."""
+        self.prepare_import(job_id, prior_file_id, path)
+        self.mark_import_submitted(job_id, result)
 
     def record_import_result(self,job_id,result):
         with self._connect() as c:c.execute("UPDATE retry_jobs SET import_result=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(json.dumps(result),job_id))
@@ -86,6 +126,44 @@ class Store:
     def list_importing(self):
         with self._connect() as c: rows=c.execute("SELECT * FROM retry_jobs WHERE status='importing' ORDER BY id").fetchall()
         return [self._decode(r,("metadata","import_result")) for r in rows]
+
+    def prepare_notification(self, job_id, attempt_id, chat_id, text, evidence):
+        with self._connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute(
+                "UPDATE source_attempts SET verdict='notification_pending',updated_at=CURRENT_TIMESTAMP WHERE id=? AND job_id=?",
+                (attempt_id, job_id),
+            )
+            c.execute(
+                """UPDATE retry_jobs SET status='notification_pending',
+                notification_attempt_id=?,notification_chat_id=?,notification_text=?,
+                notification_evidence=?,last_error=NULL,claim_token=NULL,claimed_at=NULL,
+                updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (attempt_id, chat_id, text, json.dumps(evidence), job_id),
+            )
+
+    def list_pending_notifications(self):
+        with self._connect() as c:
+            rows = c.execute(
+                "SELECT * FROM retry_jobs WHERE status='notification_pending' ORDER BY id"
+            ).fetchall()
+        return [self._decode(r, ("metadata", "notification_evidence")) for r in rows]
+
+    def notification_delivered(self, job_id, attempt_id):
+        with self._connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            changed = c.execute(
+                """UPDATE retry_jobs SET status='awaiting_review',last_error=NULL,
+                updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='notification_pending'
+                AND notification_attempt_id=?""",
+                (job_id, attempt_id),
+            ).rowcount
+            if changed:
+                c.execute(
+                    "UPDATE source_attempts SET verdict='awaiting_review',updated_at=CURRENT_TIMESTAMP WHERE id=? AND job_id=? AND verdict='notification_pending'",
+                    (attempt_id, job_id),
+                )
+            return bool(changed)
 
     def get_job(self,job_id):
         with self._connect() as c:r=c.execute("SELECT * FROM retry_jobs WHERE id=?",(job_id,)).fetchone()
