@@ -160,7 +160,9 @@ class LidarrClient:
                 continue
             if track_number is not None and self._entry_number(track, "trackNumber", "track") != track_number:
                 continue
-            if disc_number is not None and self._entry_number(track, "discNumber", "disc") != disc_number:
+            # Lidarr's current API calls the disc position mediumNumber; retain
+            # legacy disc fields only as a fallback so mismatched media fail closed.
+            if disc_number is not None and self._entry_number(track, "mediumNumber", "discNumber", "disc") != disc_number:
                 continue
             matches.append(track)
         return matches[0].get("id") if len(matches) == 1 else None

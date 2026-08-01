@@ -74,6 +74,31 @@ def test_navidrome_entry_resolves_renamed_lidarr_file_by_metadata():
     assert client.resolve_track_from_navidrome_entry(entry) == 242282
 
 
+def test_navidrome_entry_metadata_fallback_uses_lidarr_medium_number_for_disc():
+    """Lidarr exposes the disc/medium position as mediumNumber on live tracks."""
+    class Session:
+        def get(self, url, **kwargs):
+            params = kwargs.get("params") or {}
+            if url.endswith("/trackfile") and not params.get("artistId"):
+                return Response([])
+            if url.endswith("/artist/lookup"):
+                return Response([{"id": 1318, "artistName": "Eminem"}])
+            if url.endswith("/album"):
+                return Response([{"id": 22984, "title": "Music to Be Murdered By (2020)"}])
+            if url.endswith("/trackfile"):
+                return Response([{"id": 99}])
+            if url.endswith("/track"):
+                return Response([{"id": 242282, "artistId": 1318, "albumId": 22984,
+                                  "trackFileId": 99, "title": "Godzilla", "trackNumber": "7",
+                                  "mediumNumber": 1, "discNumber": None}])
+            raise AssertionError(url)
+
+    entry = {"path": "Eminem/Music to Be Murdered By/01-07 - Godzilla.mp3",
+             "artist": "Eminem", "album": "Music to Be Murdered By (2020)",
+             "title": "Godzilla", "track": 7, "discNumber": 1}
+    assert LidarrClient("http://lidarr", "key", session=Session()).resolve_track_from_navidrome_entry(entry) == 242282
+
+
 def test_navidrome_entry_metadata_fallback_ignores_remote_artist_lookup_suggestion():
     class Session:
         def get(self, url, **kwargs):
