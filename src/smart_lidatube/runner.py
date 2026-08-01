@@ -81,7 +81,7 @@ def build_components():
         poller = PlaylistPoller(
             navidrome,
             store,
-            lambda entry: lidarr.resolve_track_by_path(entry.get("path", "")),
+            lidarr.resolve_track_from_navidrome_entry,
         )
     return worker, poller, telegram
 

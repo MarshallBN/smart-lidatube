@@ -51,6 +51,17 @@ class LidarrClient:
             return payload.get("records", [])
         return []
 
+    def _paginated(self, endpoint, **params):
+        """Return a bounded Lidarr collection, following its page envelope."""
+        records = []
+        page = 1
+        while True:
+            payload = self._get(endpoint, **params, page=page, pageSize=250)
+            records.extend(self._records(payload))
+            if not isinstance(payload, dict) or len(records) >= payload.get("totalRecords", len(records)):
+                return records
+            page += 1
+
     def resolve_track_by_path(self, song_path):
         """Resolve a Navidrome path without relying on its database IDs."""
         raw = str(song_path).replace("\\", "/")
@@ -61,14 +72,7 @@ class LidarrClient:
             except ValueError:
                 return None
         wanted = PurePosixPath(raw)
-        files = []
-        page = 1
-        while True:
-            payload = self._get("trackfile", page=page, pageSize=250)
-            files.extend(self._records(payload))
-            if not isinstance(payload, dict) or len(files) >= payload.get("totalRecords", len(files)):
-                break
-            page += 1
+        files = self._paginated("trackfile")
         matches = []
         for track_file in files:
             candidate = PurePosixPath(str(track_file.get("path", "")).replace("\\", "/"))
@@ -89,17 +93,90 @@ class LidarrClient:
         return None
 
     @staticmethod
+    def _normalized_metadata(value):
+        """Compare display metadata without making filename-derived guesses."""
+        import re
+
+        value = re.sub(r"\s*\(\d{4}\)\s*", " ", str(value or ""))
+        return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+    @staticmethod
+    def _entry_number(entry, *names):
+        for name in names:
+            value = entry.get(name)
+            if value not in (None, ""):
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def resolve_track_from_navidrome_entry(self, entry):
+        """Resolve an entry by path first, then narrowly by Lidarr metadata.
+
+        The fallback deliberately requires unique artist, album and track results;
+        it never picks an arbitrary similarly named recording.
+        """
+        track_id = self.resolve_track_by_path(entry.get("path", ""))
+        if track_id is not None:
+            return track_id
+
+        artist_name = entry.get("artist") or entry.get("artistName")
+        album_title = entry.get("album") or entry.get("albumName")
+        title = entry.get("title")
+        if not all((artist_name, album_title, title)):
+            return None
+        artists = self._records(self._get("artist/lookup", term=artist_name))
+        wanted_artist = self._normalized_metadata(artist_name)
+        artists = [artist for artist in artists if self._normalized_metadata(
+            artist.get("artistName") or artist.get("name")) == wanted_artist]
+        if len(artists) != 1:
+            return None
+        artist_id = artists[0].get("id")
+        if artist_id is None:
+            return None
+        wanted_album = self._normalized_metadata(album_title)
+        albums = [album for album in self._paginated("album", artistId=artist_id)
+                  if self._normalized_metadata(album.get("title")) == wanted_album]
+        if len(albums) != 1:
+            return None
+        album_id = albums[0].get("id")
+        if album_id is None:
+            return None
+        file_ids = {item.get("id") for item in self._paginated("trackfile", artistId=artist_id)
+                    if item.get("id") is not None}
+        if not file_ids:
+            return None
+        wanted_title = self._normalized_metadata(title)
+        track_number = self._entry_number(entry, "track", "trackNumber")
+        disc_number = self._entry_number(entry, "discNumber", "disc")
+        matches = []
+        for track in self._paginated("track", albumId=album_id):
+            if track.get("trackFileId") not in file_ids:
+                continue
+            if self._normalized_metadata(track.get("title")) != wanted_title:
+                continue
+            if track_number is not None and self._entry_number(track, "trackNumber", "track") != track_number:
+                continue
+            if disc_number is not None and self._entry_number(track, "discNumber", "disc") != disc_number:
+                continue
+            matches.append(track)
+        return matches[0].get("id") if len(matches) == 1 else None
+
+    @staticmethod
     def track_identity(track):
         """Tolerantly extract expected MB recording ID, duration and labels."""
         recording_id = next(
             (
                 value
                 for value in (
-                    track.get("foreignTrackId"),
-                    track.get("musicBrainzTrackId"),
                     track.get("musicBrainzRecordingId"),
+                    track.get("foreignRecordingId"),
+                    track.get("recordingId"),
                     track.get("foreignId"),
                     (track.get("recording") or {}).get("id"),
+                    track.get("foreignTrackId"),
+                    track.get("musicBrainzTrackId"),
                 )
                 if value
             ),
