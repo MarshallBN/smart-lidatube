@@ -3,6 +3,8 @@
 import logging
 import os
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from smart_lidatube.audit import AuditConfig, AuditWorker
 from smart_lidatube.clients import LidarrClient, NavidromeClient, YouTubeClient
@@ -113,6 +115,16 @@ def run_forever():
                 pass
             audit.process_once()  # only runs after retry/import work yields idle
             if telegram:
+                timezone = ZoneInfo(env("SMART_AUDIT_TIMEZONE", "UTC"))
+                now = datetime.now(timezone)
+                report_time = env("SMART_AUDIT_REPORT_TIME", "20:00")
+                if now.strftime("%H:%M") >= report_time and not worker.store.regular_work_pending():
+                    chat = worker.review_chat_id
+                    if chat is not None:
+                        telegram.send_audit_digest(
+                            chat, now.date().isoformat(),
+                            env("SMART_AUDIT_REPORT_EMPTY", "false").lower() == "true",
+                        )
                 telegram.poll_once()
         except Exception:
             LOGGER.exception("smart worker cycle failed")
