@@ -10,59 +10,48 @@ class Response:
         if self.status_code >= 400: raise RuntimeError(self.status_code)
 
 
-def test_lidarr_manual_import_replace_body():
-    calls=[]
-    session=type("S",(),{"get":lambda s,*a,**k:Response({}), "post":lambda s,*a,**k:(calls.append((a,k)) or Response(status=202)), "delete":lambda s,*a,**k:Response()})()
-    c=LidarrClient("http://lidarr", "key", session=session)
-    c.manual_import("/lidatube/downloads/.smart-staging/1/candidate.m4a", {"id":12,"title":"Song","artistId":2,"albumId":3,"albumReleaseId":4})
-    body=calls[0][1]["json"][0]
-    assert body["replaceExistingFiles"] is True and body["path"].startswith("/lidatube/downloads/.smart-staging/")
-    assert calls[0][0][0].endswith("/api/v1/manualimport")
-
-
-def test_lidarr_manual_import_omits_discovery_rejections_and_fails_on_returned_rejections():
-    candidate = {
-        "path": "/stage/godzilla.m4a", "quality": {"quality": {"id": 7}},
+def test_lidarr_manual_import_submits_direct_command_without_discovery():
+    sibling_candidate = {
+        "path": "/stage/godzilla.m4a", "trackIds": [242162],
         "rejections": ["Album match is not close enough", "Has missing tracks"],
     }
 
     class Session:
         def __init__(self):
-            self.body = None
+            self.gets = []
+            self.posts = []
 
         def get(self, url, **kwargs):
-            return Response([candidate])
+            self.gets.append((url, kwargs))
+            return Response([sibling_candidate])
 
         def post(self, url, **kwargs):
-            self.body = kwargs["json"][0]
-            return Response([candidate], 202)
+            self.posts.append((url, kwargs))
+            return Response({"status": "queued"}, 202)
 
     session = Session()
     track = {"id": 242282, "title": "Godzilla", "artistId": 1318,
              "albumId": 22984, "albumReleaseId": 20}
-    with pytest.raises(ValueError, match="Album match is not close enough; Has missing tracks"):
-        LidarrClient("http://lidarr", "key", session=session).manual_import(
-            "/stage/godzilla.m4a", track
-        )
-    assert "rejections" not in session.body
-
-
-def test_lidarr_manual_import_accepts_returned_candidate_without_rejections():
-    candidate = {"path": "/stage/song.m4a", "quality": {"quality": {"id": 7}}}
-
-    class Session:
-        def get(self, url, **kwargs):
-            return Response([candidate])
-
-        def post(self, url, **kwargs):
-            assert "rejections" not in kwargs["json"][0]
-            return Response([candidate], 202)
-
-    track = {"id": 1, "title": "Song", "artistId": 2, "albumId": 3,
-             "albumReleaseId": 4}
-    assert LidarrClient("http://lidarr", "key", session=Session()).manual_import(
-        "/stage/song.m4a", track
-    ) == [candidate]
+    result = LidarrClient("http://lidarr", "key", session=session).manual_import(
+        "/stage/godzilla.m4a", track
+    )
+    assert result == {"status": "queued"}
+    assert session.gets == []  # Ignore the sibling candidate/rejections entirely.
+    assert session.posts == [("http://lidarr/api/v1/command", {
+        "json": {
+            "name": "ManualImport",
+            "files": [{
+                "path": "/stage/godzilla.m4a", "artistId": 1318,
+                "albumId": 22984, "albumReleaseId": 20, "trackIds": [242282],
+                "quality": {}, "indexerFlags": 0, "downloadId": "",
+                "disableReleaseSwitching": False,
+            }],
+            "importMode": "Auto",
+            "replaceExistingFiles": True,
+        },
+        "headers": {"X-Api-Key": "key", "Content-Type": "application/json"},
+        "timeout": 30,
+    })]
 
 
 def test_lidarr_manual_import_looks_up_album_release_when_track_omits_it():
@@ -87,7 +76,7 @@ def test_lidarr_manual_import_looks_up_album_release_when_track_omits_it():
         "id": 242282, "title": "Godzilla", "artistId": 1318, "albumId": 22984,
     })
     assert calls[0][1].endswith("/api/v1/album/22984")
-    assert calls[-1][2]["json"][0]["albumReleaseId"] == 20
+    assert calls[-1][2]["json"]["files"][0]["albumReleaseId"] == 20
 
 
 def test_lidarr_manual_import_uses_deterministic_official_release_or_fails_without_release():
@@ -112,7 +101,7 @@ def test_lidarr_manual_import_uses_deterministic_official_release_or_fails_witho
         {"id": 7, "monitored": False, "status": "Official"},
     ])
     LidarrClient("http://lidarr", "key", session=session).manual_import("/stage/a.m4a", track)
-    assert session.posts[0]["json"][0]["albumReleaseId"] == 7
+    assert session.posts[0]["json"]["files"][0]["albumReleaseId"] == 7
 
     import pytest
     with pytest.raises(ValueError, match="album 3 has no releases"):

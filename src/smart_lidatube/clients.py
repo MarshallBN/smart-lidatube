@@ -1,7 +1,6 @@
 """HTTP and media-source clients used by the smart worker."""
 
 from pathlib import Path, PurePosixPath
-from copy import deepcopy
 from uuid import uuid4
 
 import requests
@@ -255,36 +254,25 @@ class LidarrClient:
                     "albumId": track.get("albumId"), "albumReleaseId": self._manual_import_release_id(track)}
         if any(value in (None, "") for value in required.values()):
             raise ValueError("manual import requires track, artist, album and release IDs")
-        try:
-            discovered = self._records(self._get("manualimport", folder=str(Path(path).parent), filterExistingFiles=False))
-        except Exception:
-            discovered = []  # Compatibility fallback for unsupported Lidarr versions.
-        selected = next((item for item in discovered if PurePosixPath(str(item.get("path", ""))) == PurePosixPath(str(path))), None)
-        body = deepcopy(selected) if selected else {
-            "id": track["id"],
-            "path": str(path),
-            "name": track.get("title", ""),
-            "artistId": track.get("artistId"),
-            "albumId": track.get("albumId"),
-            "albumReleaseId": required["albumReleaseId"],
-            "quality": {},
-            "releaseGroup": "",
-            "indexerFlags": 0,
-            "downloadId": "",
-            "additionalFile": False,
+        body = {
+            "name": "ManualImport",
+            "files": [{
+                "path": str(path),
+                "artistId": required["artistId"],
+                "albumId": required["albumId"],
+                "albumReleaseId": required["albumReleaseId"],
+                "trackIds": [required["id"]],
+                "quality": {},
+                "indexerFlags": 0,
+                "downloadId": "",
+                "disableReleaseSwitching": False,
+            }],
+            "importMode": "Auto",
             "replaceExistingFiles": True,
-            "disableReleaseSwitching": False,
         }
-        # Discovery rejections are Lidarr validation output, not client-settable
-        # selection fields.  Sending them back can make Lidarr reject an otherwise
-        # explicitly mapped import.
-        body.pop("rejections", None)
-        body.update({"id": track["id"], "trackIds": [track["id"]], "path": str(path),
-                     "name": track.get("title", ""), **required,
-                     "replaceExistingFiles": True, "disableReleaseSwitching": False})
         response = self.session.post(
-            f"{self.base}/api/v1/manualimport",
-            json=[body],
+            f"{self.base}/api/v1/command",
+            json=body,
             headers={**self.headers, "Content-Type": "application/json"},
             timeout=self.timeout,
         )
@@ -293,25 +281,7 @@ class LidarrClient:
             result = response.json()
         except (ValueError, AttributeError):
             return None
-        rejections = self._manual_import_rejections(result)
-        if rejections:
-            raise ValueError("Lidarr manual import rejected: " + "; ".join(rejections))
         return result
-
-    @staticmethod
-    def _manual_import_rejections(result):
-        """Extract only Lidarr's explicit candidate-validation messages."""
-        candidates = result if isinstance(result, list) else [result]
-        messages = []
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-            for rejection in candidate.get("rejections") or []:
-                if isinstance(rejection, dict):
-                    rejection = rejection.get("reason") or rejection.get("message")
-                if isinstance(rejection, str) and rejection.strip():
-                    messages.append(rejection.strip())
-        return messages
 
     def import_succeeded(self, result):
         """Reject an explicit Lidarr failure; async queued responses are successful."""

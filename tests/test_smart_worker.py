@@ -67,8 +67,9 @@ def test_lidarr_identity_path_resolution_and_release_fallback():
     assert identity["recording_id"] == "mb-track"
     assert identity["duration"] == 201
     client.manual_import("/downloads/.smart-staging/1/a.m4a", client.get_track(7))
-    assert posts[0][1]["json"][0]["albumReleaseId"] == 44
-    assert posts[0][1]["json"][0]["replaceExistingFiles"] is True
+    assert posts[0][0].endswith("/api/v1/command")
+    assert posts[0][1]["json"]["files"][0]["albumReleaseId"] == 44
+    assert posts[0][1]["json"]["replaceExistingFiles"] is True
 
 
 def test_youtube_search_and_download_are_injectable(tmp_path):

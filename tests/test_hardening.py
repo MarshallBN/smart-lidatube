@@ -50,7 +50,7 @@ def test_claim_lease_recovery_retry_schedule_and_import_state(tmp_path):
     assert saved["status"] == "importing" and saved["prior_track_file_id"] == 9
 
 
-def test_manual_import_discovery_round_trip_and_required_ids():
+def test_manual_import_direct_command_and_required_ids():
     calls = []
     class Session:
         def get(self, url, **kwargs):
@@ -60,9 +60,11 @@ def test_manual_import_discovery_round_trip_and_required_ids():
             calls.append(("post", url, kwargs)); return Response({"status":"queued"}, 202)
     track={"id":1,"title":"S","artistId":2,"albumId":3,"albumReleaseId":4}
     LidarrClient("http://l", "k", session=Session()).manual_import("/stage/a.m4a", track)
-    body=calls[-1][2]["json"][0]
-    assert calls[0][0] == "get" and body["quality"]["quality"]["id"] == 7
-    assert body["artistId"] == 2 and body["trackIds"] == [1] and body["replaceExistingFiles"] is True
+    body=calls[-1][2]["json"]
+    assert len(calls) == 1 and calls[0][0] == "post" and calls[0][1].endswith("/api/v1/command")
+    assert body["name"] == "ManualImport" and body["importMode"] == "Auto"
+    assert body["files"][0]["artistId"] == 2 and body["files"][0]["trackIds"] == [1]
+    assert body["replaceExistingFiles"] is True
     with pytest.raises(ValueError): LidarrClient("http://l", "k", session=Session()).manual_import("/stage/a", {"id":1})
 
 
