@@ -1,0 +1,100 @@
+from datetime import datetime
+from pathlib import Path
+
+from smart_lidatube.audit import AuditConfig, AuditWorker, classify_verification, recheck_seconds
+from smart_lidatube.fingerprint import Verification
+from smart_lidatube.store import Store
+
+
+def test_audit_schema_sanitizes_evidence_and_exemptions(tmp_path):
+    store = Store(tmp_path / "audit.db")
+    store.upsert_audit_track(7, priority_score=400)
+    store.record_audit_result(7, "suspect", {"url": "https://user:secret@example/x", "error": "Bearer abc", "reason": "duration_mismatch"})
+    row = store.get_audit_track(7)
+    assert row["status"] == "suspect"
+    assert "secret" not in str(row["evidence_json"]) and "Bearer" not in str(row["evidence_json"])
+    assert row["evidence_json"]["reason"] == "duration_mismatch"
+    store.set_audit_exemption(7, do_not_audit=True)
+    assert store.list_eligible_audits() == []
+    assert store.get_job(999) is None  # retry ledger remains separate
+
+
+def test_classifications_and_backoff_are_typed():
+    assert classify_verification(Verification("accepted", "recording_match", {})) == "verified"
+    assert classify_verification(Verification("rejected", "recording_mismatch", {})) == "suspect"
+    assert classify_verification(Verification("inconclusive", "fingerprint_error", {})) == "unverifiable"
+    assert classify_verification(Verification("inconclusive", "low_score", {})) == "likely_correct"
+    assert recheck_seconds("unverifiable", 3) > recheck_seconds("unverifiable", 1)
+    assert recheck_seconds("exempt", 0) is None
+
+
+def test_priority_and_fairness_select_oldest_every_fifth_slot(tmp_path):
+    store = Store(tmp_path / "audit.db")
+    store.upsert_audit_track(1, priority_score=1000)
+    store.upsert_audit_track(2, priority_score=900)
+    store.upsert_audit_track(3, priority_score=1)
+    # Oldest record is selected by the reserved 20% fairness slot.
+    store.set_audit_last_checked(1, "2025-01-01 00:00:00")
+    store.set_audit_last_checked(2, "2024-01-01 00:00:00")
+    store.set_audit_last_checked(3, "2000-01-01 00:00:00")
+    selected = [store.select_audit_candidate(0.20)["lidarr_track_id"] for _ in range(5)]
+    assert selected[:4] == [1, 1, 1, 1]
+    assert selected[4] == 3
+
+
+def test_budget_idle_guard_and_read_only_single_track_audit(tmp_path):
+    class Lidarr:
+        def get_track(self, track_id):
+            return {"id": track_id, "trackFileId": 9, "title": "Song", "artist": {"artistName": "Artist"}, "duration": 120, "musicBrainzRecordingId": "rec"}
+        def get_track_file(self, file_id):
+            return {"id": file_id, "path": str(media), "size": media.stat().st_size}
+        @staticmethod
+        def track_identity(track):
+            return {"recording_id": "rec", "duration": 120, "artist": "Artist", "title": "Song", "track_file_id": 9}
+        def manual_import(self, *args):
+            raise AssertionError("audit must not import")
+    class Verifier:
+        def verify_file(self, path, identity):
+            assert Path(path) == media
+            return Verification("accepted", "recording_match", {})
+    media = tmp_path / "organized.m4a"; media.write_bytes(b"audio")
+    store = Store(tmp_path / "audit.db"); store.upsert_audit_track(8, priority_score=100)
+    worker = AuditWorker(store, Lidarr(), Verifier(), AuditConfig(budget_per_hour=1, max_token_bank=2))
+    assert worker.process_once() == 8
+    assert store.get_audit_track(8)["status"] == "verified"
+    assert worker.process_once() is None  # token budget
+    store.upsert_audit_track(10, priority_score=100)
+    store.enqueue_job(99, "user-work")
+    assert worker.process_once() is None  # queued retry wins
+
+
+def test_missing_file_and_exception_never_persist_raw_error_or_side_effects(tmp_path):
+    class Lidarr:
+        def get_track(self, track_id): return {"id": track_id, "trackFileId": 2, "title": "Song", "artist": {"artistName": "Artist"}}
+        def get_track_file(self, file_id): return {"id": file_id, "path": str(tmp_path / "missing")}
+        @staticmethod
+        def track_identity(track): return {"artist": "Artist", "title": "Song"}
+    store = Store(tmp_path / "audit.db"); store.upsert_audit_track(1)
+    assert AuditWorker(store, Lidarr(), object(), AuditConfig()).process_once() == 1
+    row = store.get_audit_track(1)
+    assert row["status"] == "unavailable"
+    assert str(tmp_path) not in str(row["evidence_json"])
+
+
+def test_daily_digest_dedupe_pagination_and_sanitization(tmp_path):
+    from smart_lidatube.telegram import TelegramBot
+    store = Store(tmp_path / "audit.db")
+    for track in range(12):
+        store.upsert_audit_track(track)
+        store.record_audit_result(track, "suspect", {"artist": "A", "title": f"T{track}", "error": "https://x:token@y", "reason": "recording_mismatch"})
+    sent = []
+    bot = TelegramBot("token", store, {1}, {2}, request=lambda method, payload: sent.append((method, payload)) or {})
+    today = datetime.now().strftime("%Y-%m-%d")
+    assert bot.send_audit_digest(2, today) is True
+    assert bot.send_audit_digest(2, today) is False
+    payload = sent[0][1]
+    assert "token" not in payload["text"] and "https:" not in payload["text"]
+    callback = payload["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+    assert bot.handle_callback({"id": "x", "from": {"id": 1}, "message": {"chat": {"id": 2}}, "data": callback}) is True
+    assert any(method == "sendMessage" and "Page 1/2" in body["text"] for method, body in sent)
+    assert bot.send_audit_digest(2, "2000-01-01") is False  # no changes for this date

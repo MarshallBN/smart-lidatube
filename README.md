@@ -100,6 +100,14 @@ Set `NAVIDROME_MUSIC_ROOT` and `LIDARR_MUSIC_ROOT` when their library mount root
 
 Uppercase smart variables and lowercase legacy Lidarr variables are accepted by the sidecar. This MVP is covered by mocked behavioral/integration tests and a container health smoke test where Docker is available.
 
+### Library integrity auditor (read-only)
+
+The smart worker also contains a conservative library auditor. It records a separate SQLite ledger and uses Lidarr's current track-file resolution plus the existing `FileVerifier`/fpcalc/AcoustID path to classify an organized file as `verified`, `likely_correct`, `suspect`, `unverifiable`, or `unavailable`. It does **not** search YouTube, download media, create retry jobs, send remediation prompts, call a Lidarr import command, or change library files.
+
+Set `SMART_AUDIT_ENABLED=true` to enable it (default budget: `SMART_AUDIT_VERIFY_BUDGET_PER_HOUR=12`; capped carryover: `SMART_AUDIT_MAX_TOKEN_BANK=24`). The auditor yields whenever a normal retry/import/review job exists and reserves every fifth eligible selection for the longest-unchecked track (`SMART_AUDIT_FAIRNESS_SHARE=0.20`). Candidate discovery stays disabled (`SMART_AUDIT_CANDIDATE_SEARCH_BUDGET_PER_HOUR=0`). Inspect aggregate progress through authenticated `GET /api/smart/audit/status`.
+
+Telegram audit summaries are report-only and deduplicated per day in SQLite. They are sent only when classifications changed (unless `SMART_AUDIT_REPORT_EMPTY=true`) and detail callbacks are paginated. Audit persistence and reports deliberately retain only safe category/reason and track display fields—never paths, URLs, raw exceptions, headers, or credentials.
+
 ### Operational recovery and runbook
 
 The worker is deliberately fail-closed at the Lidarr boundary:

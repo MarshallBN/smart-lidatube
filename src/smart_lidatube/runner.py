@@ -4,6 +4,7 @@ import logging
 import os
 import time
 
+from smart_lidatube.audit import AuditConfig, AuditWorker
 from smart_lidatube.clients import LidarrClient, NavidromeClient, YouTubeClient
 from smart_lidatube.fingerprint import AcoustIDClient, FileVerifier, Fpcalc
 from smart_lidatube.retry import PlaylistPoller
@@ -83,12 +84,21 @@ def build_components():
             store,
             lidarr.resolve_track_from_navidrome_entry,
         )
-    return worker, poller, telegram
+    audit_config = AuditConfig(
+        enabled=env("SMART_AUDIT_ENABLED", "true").lower() == "true",
+        budget_per_hour=int(env("SMART_AUDIT_VERIFY_BUDGET_PER_HOUR", "12")),
+        max_token_bank=int(env("SMART_AUDIT_MAX_TOKEN_BANK", "24")),
+        fairness_share=float(env("SMART_AUDIT_FAIRNESS_SHARE", "0.20")),
+    )
+    store.set_setting("audit_enabled", str(audit_config.enabled).lower())
+    store.set_setting("audit_budget_per_hour", audit_config.budget_per_hour)
+    audit = AuditWorker(store, lidarr, verifier, audit_config)
+    return worker, poller, telegram, audit
 
 
 def run_forever():
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
-    worker, poller, telegram = build_components()
+    worker, poller, telegram, audit = build_components()
     interval = float(env("SMART_POLL_INTERVAL", "10"))
     while True:
         try:
@@ -101,6 +111,7 @@ def run_forever():
                 poller.poll_once()
             while worker.process_once() is not None:
                 pass
+            audit.process_once()  # only runs after retry/import work yields idle
             if telegram:
                 telegram.poll_once()
         except Exception:

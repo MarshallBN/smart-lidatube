@@ -52,6 +52,11 @@ def register_api(app, store, token):
             return jsonify(value), 200
         return jsonify(error="not found"), 404
 
+    @app.get("/api/smart/audit/status")
+    @auth
+    def audit_status():
+        return jsonify(audit=store.audit_status())
+
     @app.get("/health")
     def health():
         return jsonify(status="ok")

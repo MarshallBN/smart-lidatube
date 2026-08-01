@@ -68,6 +68,36 @@ class TelegramBot:
         self.request("sendMessage", {"chat_id": chat_id, "text": text})
         return True
 
+    def send_audit_digest(self, chat_id, date, report_empty=False):
+        """Send one safe daily report; details remain bounded behind callbacks."""
+        key = f"audit_digest_sent:{date}"
+        if self.store.get_setting(key):
+            return False
+        events = self.store.audit_digest_events(date)
+        if not events and not report_empty:
+            return False
+        if int(chat_id) not in self.allowed_chats:
+            return False
+        counts = {}
+        for event in events: counts[event["result_status"]] = counts.get(event["result_status"], 0) + 1
+        text = "Library audit — %s\nUpdated classifications: %s\n%s" % (date, len(events), ", ".join(f"{k}: {v}" for k,v in sorted(counts.items())) or "No changes")
+        payload = {"chat_id": chat_id, "text": text}
+        if events:
+            payload["reply_markup"] = {"inline_keyboard": [[{"text": f"Details ({len(events)})", "callback_data": f"audit:{date}:0"}]]}
+        self.request("sendMessage", payload)
+        self.store.set_setting(key, "1")
+        return True
+
+    def _send_audit_page(self, chat_id, date, page):
+        events=self.store.audit_digest_events(date); start=page*10; chunk=events[start:start+10]; pages=max(1,(len(events)+9)//10)
+        lines=[f"Library audit details — {date}", f"Page {page+1}/{pages}"]
+        for event in chunk:
+            safe=event["evidence_json"]; lines.append("• %s — %s — %s (%s)" % (safe.get("artist", "Track"), safe.get("title", event["lidarr_track_id"]), event["result_status"], safe.get("reason", "checked")))
+        buttons=[]
+        if page: buttons.append({"text":"Previous","callback_data":f"audit:{date}:{page-1}"})
+        if page+1<pages: buttons.append({"text":"Next","callback_data":f"audit:{date}:{page+1}"})
+        self.request("sendMessage", {"chat_id":chat_id,"text":"\n".join(lines),"reply_markup":{"inline_keyboard":[buttons]} if buttons else {}})
+
     def handle_callback(self, query):
         user = int(query.get("from", {}).get("id", -1))
         chat = int(query.get("message", {}).get("chat", {}).get("id", -1))
@@ -75,6 +105,13 @@ class TelegramBot:
             return False
         try:
             prefix, raw_id, action = query["data"].split(":")
+            if prefix == "audit":
+                page = int(action)
+                if page < 0:
+                    return False
+                self._send_audit_page(chat, raw_id, page)
+                self.request("answerCallbackQuery", {"callback_query_id": query["id"], "text": "Audit details."})
+                return True
             attempt_id = int(raw_id)
         except (KeyError, ValueError):
             return False
