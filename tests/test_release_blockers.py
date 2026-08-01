@@ -62,6 +62,35 @@ def test_import_phases_are_durable_and_prepared_is_not_resubmitted(tmp_path):
     assert "prepared" in saved["last_error"].lower()
 
 
+def test_manual_import_exception_after_prepared_barrier_requires_attention(tmp_path):
+    store = Store(tmp_path / "db")
+    job = store.enqueue_job(7, "manual-import-exception")
+    staged = tmp_path / ".smart-staging" / str(job) / "candidate.m4a"
+    staged.parent.mkdir(parents=True)
+    staged.write_bytes(b"audio")
+    attempt = store.add_attempt(job, "youtube", "candidate")
+    store.update_attempt(attempt, verdict="manual_accepted", staged_path=staged)
+
+    class Lidarr:
+        def get_track(self, _):
+            return {"id": 7, "trackFileId": 10}
+
+        def manual_import(self, _, __):
+            raise RuntimeError("album release lookup failed at https://user:secret@lidarr")
+
+    worker = JobWorker(store, Lidarr(), None, None, tmp_path)
+    assert worker.process_once() == job
+    saved = store.get_job(job)
+    assert saved["status"] == "import_attention"
+    assert saved["import_phase"] == "prepared"
+    assert saved["import_submitted_at"] is None
+    assert saved["last_error"] == (
+        "Lidarr manual import submission failed: "
+        "album release lookup failed at https://user:***@lidarr"
+    )
+    assert "secret" not in saved["last_error"]
+
+
 def test_submitted_import_times_out_and_never_uses_missing_stage_as_success(tmp_path):
     store = Store(tmp_path / "db")
     job = store.enqueue_job(7, "submitted")

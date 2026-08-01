@@ -1,4 +1,5 @@
 """Autonomous targeted replacement job lifecycle."""
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -248,6 +249,11 @@ class JobWorker:
         )
         self.retry_notifications()
 
+    @staticmethod
+    def _safe_error(exc):
+        """Keep diagnostic errors useful without persisting credentials in URLs."""
+        return re.sub(r"(?i)(https?://[^/@\s]+:)[^@\s]+@", r"\1***@", str(exc))
+
     def _import(self, job, track, attempt):
         local = Path(attempt.get("staged_path") or "")
         if not local.is_file() or local.stat().st_size <= 0:
@@ -257,7 +263,17 @@ class JobWorker:
         )
         prior = track.get("trackFileId")
         self.store.prepare_import(job["id"], prior, visible)
-        result = self.lidarr.manual_import(visible, track)
+        try:
+            result = self.lidarr.manual_import(visible, track)
+        except Exception as exc:
+            self.store.update_job(
+                job["id"], "import_attention",
+                error=(
+                    "Lidarr manual import submission failed: "
+                    f"{self._safe_error(exc)}"
+                ),
+            )
+            return
         succeeded = getattr(
             self.lidarr, "import_succeeded", lambda value: value is not False
         )
