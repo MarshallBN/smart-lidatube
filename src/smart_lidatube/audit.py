@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 AUDIT_STATUSES = {"never_checked", "verified", "likely_correct", "suspect", "unverifiable", "unavailable", "exempt"}
 
@@ -11,6 +12,8 @@ class AuditConfig:
     budget_per_hour: int = 12
     max_token_bank: int = 24
     fairness_share: float = .20
+    bootstrap_batch_size: int = 100
+    timezone: str = "UTC"
 
 def classify_verification(result):
     if result.verdict == "accepted": return "verified"
@@ -40,10 +43,25 @@ class AuditWorker:
             self.store.set_setting("audit_tokens",f"{tokens}:{now}"); return False
         self.store.set_setting("audit_tokens",f"{tokens-1}:{now}"); return True
 
+    def bootstrap_once(self):
+        """Read one Lidarr page and add only tracks that already have a file."""
+        enumerate_tracks = getattr(self.lidarr, "list_audit_tracks", None)
+        if not enumerate_tracks:
+            return 0
+        cursor = int(self.store.get_setting("audit_bootstrap_cursor", "1"))
+        tracks, next_cursor = enumerate_tracks(cursor, self.config.bootstrap_batch_size)
+        added = 0
+        for track in tracks:
+            if track.get("id") is not None and track.get("trackFileId"):
+                self.store.upsert_audit_track(track["id"])
+                added += 1
+        self.store.set_setting("audit_bootstrap_cursor", next_cursor if next_cursor is not None else 1)
+        return added
+
     def process_once(self):
-        if not self.config.enabled or self.store.regular_work_pending() or not self._token(): return None
+        if not self.config.enabled or self.store.regular_work_pending(): return None
         row=self.store.select_audit_candidate(self.config.fairness_share)
-        if not row: return None
+        if not row or not self._token(): return None
         track_id=row["lidarr_track_id"]
         try:
             track=self.lidarr.get_track(track_id); identity=self.lidarr.track_identity(track)
@@ -62,4 +80,5 @@ class AuditWorker:
     def _save(self,track_id,status,evidence,marker=None,count=0):
         seconds=recheck_seconds(status,count)
         next_at=(self.clock()+timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S") if seconds else None
-        self.store.record_audit_result(track_id,status,evidence,next_at,marker,error_code=evidence.get("reason"))
+        local_day=self.clock().astimezone(ZoneInfo(self.config.timezone)).date().isoformat()
+        self.store.record_audit_result(track_id,status,evidence,next_at,marker,error_code=evidence.get("reason"),audit_local_day=local_day)

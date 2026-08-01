@@ -91,16 +91,20 @@ def build_components():
         budget_per_hour=int(env("SMART_AUDIT_VERIFY_BUDGET_PER_HOUR", "12")),
         max_token_bank=int(env("SMART_AUDIT_MAX_TOKEN_BANK", "24")),
         fairness_share=float(env("SMART_AUDIT_FAIRNESS_SHARE", "0.20")),
+        bootstrap_batch_size=int(env("SMART_AUDIT_BOOTSTRAP_BATCH_SIZE", "100")),
+        timezone=env("SMART_AUDIT_TIMEZONE", "UTC"),
     )
     store.set_setting("audit_enabled", str(audit_config.enabled).lower())
     store.set_setting("audit_budget_per_hour", audit_config.budget_per_hour)
     audit = AuditWorker(store, lidarr, verifier, audit_config)
-    return worker, poller, telegram, audit
+    worker.audit_worker = audit
+    return worker, poller, telegram
 
 
 def run_forever():
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
-    worker, poller, telegram, audit = build_components()
+    worker, poller, telegram = build_components()
+    audit = worker.audit_worker
     interval = float(env("SMART_POLL_INTERVAL", "10"))
     while True:
         try:
@@ -113,7 +117,9 @@ def run_forever():
                 poller.poll_once()
             while worker.process_once() is not None:
                 pass
-            audit.process_once()  # only runs after retry/import work yields idle
+            if not worker.store.regular_work_pending():
+                audit.bootstrap_once()
+                audit.process_once()  # only runs after retry/import work yields idle
             if telegram:
                 timezone = ZoneInfo(env("SMART_AUDIT_TIMEZONE", "UTC"))
                 now = datetime.now(timezone)

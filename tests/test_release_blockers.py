@@ -182,3 +182,10 @@ def test_runner_wires_all_worker_lifecycle_settings(monkeypatch, tmp_path):
     assert worker.max_attempts == 8
     assert worker.import_verify_interval == 3
     assert worker.import_verify_timeout == 17
+
+
+def test_build_components_retains_three_item_public_return(monkeypatch, tmp_path):
+    monkeypatch.setenv("SMART_DB_PATH", str(tmp_path / "db"))
+    components = build_components()
+    assert len(components) == 3
+    assert hasattr(components[0], "audit_worker")

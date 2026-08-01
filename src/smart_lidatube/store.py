@@ -1,6 +1,7 @@
 """Durable, concurrency-safe SQLite state for smart retries."""
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -25,8 +26,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS library_audit_tracks(lidarr_track_id INTEGER PRIMARY KEY,status TEXT NOT NULL DEFAULT 'never_checked',priority_score INTEGER NOT NULL DEFAULT 0,last_checked_at TEXT,next_check_at TEXT,check_count INTEGER NOT NULL DEFAULT 0,last_file_marker TEXT,last_verifier_version TEXT,evidence_json TEXT NOT NULL DEFAULT '{}',last_error_code TEXT,last_candidate_search_at TEXT,do_not_audit INTEGER NOT NULL DEFAULT 0,do_not_upgrade INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
             CREATE INDEX IF NOT EXISTS library_audit_eligible ON library_audit_tracks(do_not_audit,next_check_at,priority_score,last_checked_at);
-            CREATE TABLE IF NOT EXISTS library_audit_events(id INTEGER PRIMARY KEY,lidarr_track_id INTEGER NOT NULL REFERENCES library_audit_tracks(lidarr_track_id),event_type TEXT NOT NULL,result_status TEXT NOT NULL,evidence_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-            CREATE INDEX IF NOT EXISTS library_audit_events_report ON library_audit_events(created_at,result_status,lidarr_track_id);
+            CREATE TABLE IF NOT EXISTS library_audit_events(id INTEGER PRIMARY KEY,lidarr_track_id INTEGER NOT NULL REFERENCES library_audit_tracks(lidarr_track_id),event_type TEXT NOT NULL,result_status TEXT NOT NULL,evidence_json TEXT NOT NULL DEFAULT '{}',audit_local_day TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+            CREATE INDEX IF NOT EXISTS library_audit_events_report ON library_audit_events(audit_local_day,result_status,lidarr_track_id);
             """)
             self._add_columns(c, "retry_jobs", {
                 "updated_at": "TEXT", "last_error": "TEXT", "claimed_at": "TEXT",
@@ -40,6 +41,10 @@ class Store:
                 "notification_evidence": "TEXT",
             })
             self._add_columns(c,"source_attempts",{"staged_path":"TEXT","updated_at":"TEXT"})
+            self._add_columns(c,"library_audit_events",{"audit_local_day":"TEXT"})
+            # Rebuild this index after adding the local-day reporting key.
+            c.execute("DROP INDEX IF EXISTS library_audit_events_report")
+            c.execute("CREATE INDEX library_audit_events_report ON library_audit_events(audit_local_day,result_status,lidarr_track_id)")
             # Repoint rejection FKs to the survivor before deleting legacy duplicates.
             c.execute("""UPDATE source_rejections SET attempt_id=(SELECT MIN(a2.id) FROM source_attempts a1 JOIN source_attempts a2 ON a2.job_id=a1.job_id AND a2.provider=a1.provider AND a2.source_id=a1.source_id WHERE a1.id=source_rejections.attempt_id) WHERE attempt_id IS NOT NULL""")
             c.execute("DELETE FROM source_attempts WHERE id NOT IN (SELECT MIN(id) FROM source_attempts GROUP BY job_id,provider,source_id)")
@@ -264,17 +269,20 @@ class Store:
     def regular_work_pending(self):
         active=("queued","processing","ready_import","importing","import_attention","notification_pending","awaiting_review")
         with self._connect() as c:return c.execute("SELECT 1 FROM retry_jobs WHERE status IN (%s) LIMIT 1" % ",".join("?"*len(active)),active).fetchone() is not None
-    def record_audit_result(self,track_id,status,evidence=None,next_check_at=None,marker=None,error_code=None):
+    def record_audit_result(self,track_id,status,evidence=None,next_check_at=None,marker=None,error_code=None,audit_local_day=None):
         self.upsert_audit_track(track_id); safe=self._safe_audit_evidence(evidence)
+        audit_local_day = audit_local_day or datetime.now(timezone.utc).date().isoformat()
         with self._connect() as c:
+            previous=c.execute("SELECT status FROM library_audit_tracks WHERE lidarr_track_id=?",(track_id,)).fetchone()["status"]
             c.execute("UPDATE library_audit_tracks SET status=?,last_checked_at=CURRENT_TIMESTAMP,next_check_at=?,check_count=check_count+1,last_file_marker=COALESCE(?,last_file_marker),evidence_json=?,last_error_code=?,updated_at=CURRENT_TIMESTAMP WHERE lidarr_track_id=?",(status,next_check_at,marker,json.dumps(safe),error_code,track_id))
-            c.execute("INSERT INTO library_audit_events(lidarr_track_id,event_type,result_status,evidence_json) VALUES(?,?,?,?)",(track_id,"classification",status,json.dumps(safe)))
+            if previous != status:
+                c.execute("INSERT INTO library_audit_events(lidarr_track_id,event_type,result_status,evidence_json,audit_local_day) VALUES(?,?,?,?,?)",(track_id,"classification_change",status,json.dumps(safe),audit_local_day))
     def audit_status(self):
         with self._connect() as c:
             total=c.execute("SELECT COUNT(*) FROM library_audit_tracks").fetchone()[0]; checked=c.execute("SELECT COUNT(*) FROM library_audit_tracks WHERE check_count>0").fetchone()[0]; eligible=c.execute("SELECT COUNT(*) FROM library_audit_tracks WHERE do_not_audit=0 AND (next_check_at IS NULL OR next_check_at<=CURRENT_TIMESTAMP)").fetchone()[0]; counts=dict(c.execute("SELECT status,COUNT(*) FROM library_audit_tracks GROUP BY status").fetchall())
         return {"checked_total":checked,"eligible_total":eligible,"total":total,"enabled":self.get_setting("audit_enabled","true")=="true","budget_per_hour":int(self.get_setting("audit_budget_per_hour","12")),"tokens_available":int(float((self.get_setting("audit_tokens", "0:0")).split(":")[0])),**counts}
     def audit_digest_events(self,date):
-        with self._connect() as c:rows=c.execute("SELECT lidarr_track_id,result_status,evidence_json FROM library_audit_events WHERE date(created_at)=? ORDER BY id",(date,)).fetchall()
+        with self._connect() as c:rows=c.execute("SELECT lidarr_track_id,result_status,evidence_json FROM library_audit_events WHERE audit_local_day=? AND event_type='classification_change' ORDER BY id",(date,)).fetchall()
         return [self._decode(row,("evidence_json",)) for row in rows]
 
     @staticmethod

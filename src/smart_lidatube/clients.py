@@ -37,6 +37,16 @@ class LidarrClient:
     def get_track_file(self, file_id):
         return self._get(f"trackfile/{file_id}")
 
+    def list_audit_tracks(self, cursor=1, limit=100):
+        """Read one bounded page of organized tracks for the audit ledger."""
+        payload = self._get("track", page=int(cursor), pageSize=int(limit))
+        tracks = self._records(payload)
+        if not isinstance(payload, dict):
+            return tracks, None
+        total = int(payload.get("totalRecords", len(tracks)))
+        next_cursor = int(cursor) + 1 if int(cursor) * int(limit) < total else None
+        return tracks, next_cursor
+
     def delete_track_file(self, file_id):
         response = self.session.delete(
             f"{self.base}/api/v1/trackfile/{file_id}",

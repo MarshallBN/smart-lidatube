@@ -98,3 +98,38 @@ def test_daily_digest_dedupe_pagination_and_sanitization(tmp_path):
     assert bot.handle_callback({"id": "x", "from": {"id": 1}, "message": {"chat": {"id": 2}}, "data": callback}) is True
     assert any(method == "sendMessage" and "Page 1/2" in body["text"] for method, body in sent)
     assert bot.send_audit_digest(2, "2000-01-01") is False  # no changes for this date
+
+
+def test_bootstrap_discovers_lidarr_library_in_bounded_batches_without_side_effects(tmp_path):
+    class Lidarr:
+        def __init__(self): self.calls = []
+        def list_audit_tracks(self, cursor, limit):
+            self.calls.append((cursor, limit))
+            return ([{"id": 11, "trackFileId": 101}, {"id": 12}], 2) if cursor == 1 else ([{"id": 13, "trackFileId": 103}], None)
+        def manual_import(self, *args): raise AssertionError("bootstrap must not import")
+    store = Store(tmp_path / "audit.db")
+    lidarr = Lidarr()
+    worker = AuditWorker(store, lidarr, object(), AuditConfig(bootstrap_batch_size=2))
+    assert worker.bootstrap_once() == 1
+    assert store.get_audit_track(11) is not None
+    assert store.get_audit_track(12) is None  # no organized file to audit
+    assert worker.bootstrap_once() == 1
+    assert store.get_audit_track(13) is not None
+    assert lidarr.calls == [(1, 2), (2, 2)]
+
+
+def test_token_is_not_consumed_until_a_candidate_exists(tmp_path):
+    store = Store(tmp_path / "audit.db")
+    clock = lambda: datetime(2026, 1, 1)
+    worker = AuditWorker(store, object(), object(), AuditConfig(max_token_bank=2), clock=clock)
+    assert worker.process_once() is None
+    assert store.get_setting("audit_tokens") is None
+
+
+def test_digest_records_only_status_changes_and_uses_explicit_local_day(tmp_path):
+    store = Store(tmp_path / "audit.db")
+    store.record_audit_result(1, "verified", {"reason": "recording_match"}, audit_local_day="2026-01-01")
+    store.record_audit_result(1, "verified", {"reason": "recording_match"}, audit_local_day="2026-01-02")
+    store.record_audit_result(1, "suspect", {"reason": "recording_mismatch"}, audit_local_day="2026-01-02")
+    assert [event["result_status"] for event in store.audit_digest_events("2026-01-01")] == ["verified"]
+    assert [event["result_status"] for event in store.audit_digest_events("2026-01-02")] == ["suspect"]
