@@ -75,7 +75,18 @@ The smart fork implements a separate autonomous worker, durable SQLite jobs and 
 
 The worker atomically claims jobs, resolves current Lidarr track identity (including MusicBrainz recording ID and duration), searches candidates, downloads into `/lidatube/downloads/.smart-staging/<job>/`, stores verification evidence, skips only rejections for the target track, and sends uncertain/manual candidates for Telegram review. Accept resumes the worker for import; reject searches the next candidate; cancel stops the job.
 
-The downloads host volume must be visible to both containers, but its container paths may differ. Set `DOWNLOADS_ROOT` to the worker path and explicitly set `LIDARR_DOWNLOADS_ROOT` to Lidarr's path for that same volume. No Lidarr service or mount is required in this repository. Paths are canonicalized, required to remain beneath `DOWNLOADS_ROOT`, and translated before import. Accepted files are discovered with `GET /api/v1/manualimport` and the matching resource is round-tripped with explicit IDs and `replaceExistingFiles=true`; unsupported/empty discovery falls back to the legacy POST body for older Lidarr versions. **Lidarr alone names, moves, sorts, and replaces final library files.** Smart retry does not overwrite, delete, or pre-delete the existing file. Staging is cleaned only after a changed Lidarr track file is verified.
+The downloads host volume must be visible to both containers, but its container paths may differ. Set `DOWNLOADS_ROOT` to the worker path and explicitly set `LIDARR_DOWNLOADS_ROOT` to Lidarr's path for that same volume. No Lidarr service or mount is required in this repository. Paths are canonicalized, required to remain beneath `DOWNLOADS_ROOT`, and translated before import.
+
+For an accepted smart retry, the worker submits Lidarr's **command API**, not the interactive-import discovery endpoint:
+
+```text
+POST /api/v1/command
+name: ManualImport
+files[0]: { path, artistId, albumId, albumReleaseId, trackIds: [target track] }
+replaceExistingFiles: true
+```
+
+`GET`/`POST /api/v1/manualimport` is Lidarr's interactive candidate-discovery/reprocessing API; it must not be used as the final one-file smart replacement action. In particular, its album-matching validation can reject a correctly selected one-file replacement as a partial album. The command payload makes the selected Lidarr track authoritative. **Lidarr alone names, moves, sorts, and replaces final library files.** Smart retry does not overwrite, delete, or pre-delete the existing file. Staging is cleaned only after a changed Lidarr track-file ID is verified.
 
 The SQLite database is created/migrated at `SMART_DB_PATH` with WAL and busy-timeout concurrency settings; back it up with the config volume. Navidrome `Retry` and `Manual Retry` are normal playlists. Entries are durably enqueued before removal, removals run in descending index order, and the occurrence is refetched/verified before deletion.
 
@@ -87,4 +98,27 @@ Set a long random `SMART_API_TOKEN`. For example: `Authorization: Bearer YOUR_LO
 
 Set `NAVIDROME_MUSIC_ROOT` and `LIDARR_MUSIC_ROOT` when their library mount roots differ. Track-file lookup is paginated and ambiguous suffix matches fail closed. Claimed work uses the `SMART_CLAIM_TIMEOUT` lease, with `SMART_RETRY_DELAY` and `SMART_MAX_ATTEMPTS` controlling retry policy. Imports durably record `prepared` before the request and `submitted` only after its HTTP response. Submitted imports are checked at `SMART_IMPORT_VERIFY_INTERVAL` until `SMART_IMPORT_VERIFY_TIMEOUT`; uncertain or timed-out imports require attention and are never automatically resubmitted. Completion requires a changed associated track-file ID (or an inspectable current file when there was no prior ID), never merely a missing staged file. Rejected candidate directories are retained for diagnosis; verified imports are cleaned. Manual review requires valid Telegram configuration; failed review notifications remain durably pending and are retried by the worker.
 
-Uppercase smart variables and lowercase legacy Lidarr variables are accepted by the sidecar. This MVP is covered by mocked behavioral/integration tests and a container health smoke test where Docker is available. It has **not** been validated against live Lidarr, Navidrome, AcoustID, YouTube, or Telegram services; API payload/version differences may require field adaptation.
+Uppercase smart variables and lowercase legacy Lidarr variables are accepted by the sidecar. This MVP is covered by mocked behavioral/integration tests and a container health smoke test where Docker is available.
+
+### Operational recovery and runbook
+
+The worker is deliberately fail-closed at the Lidarr boundary:
+
+| Job condition | Meaning | Safe operator action |
+|---|---|---|
+| `importing` / `prepared` | The durable barrier was written before Lidarr submission. | Wait for the worker unless it transitions to `import_attention`. |
+| `import_attention` + `prepared`, with no `import_result` and no `import_submitted_at` | Submission never occurred. | After correcting the cause, use the guarded retry endpoint below. It reuses the accepted staged attempt; it does not download again. |
+| `import_attention` + `submitted`, or any submission timestamp/result | Submission outcome is uncertain or needs inspection. | **Do not resubmit automatically.** Inspect Lidarr and create a new explicit retry if appropriate. |
+| `completed` | The target Lidarr track-file association changed. | Verify playback; normal staging cleanup may proceed. |
+
+```bash
+# Inspect a job (token is required)
+curl -H "Authorization: Bearer $SMART_API_TOKEN" \
+  http://SMART_LIDATUBE_HOST:5000/api/smart/jobs/JOB_ID
+
+# Only for an unsubmitted prepared import_attention job
+curl -X POST -H "Authorization: Bearer $SMART_API_TOKEN" \
+  http://SMART_LIDATUBE_HOST:5000/api/smart/jobs/JOB_ID/retry-import
+```
+
+Do not store real API tokens, passwords, bot tokens, or connection strings in the repository. Rotate any credential exposed in chat or logs and update the deployment's secret/environment configuration. The main smart workflow has been live-validated with Navidrome playlist ingestion, Telegram approval, and a Lidarr `ManualImport` command; external APIs and Lidarr versions can still require future compatibility adjustments.
