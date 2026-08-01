@@ -58,3 +58,35 @@ def test_retry_api_validates_mode_and_supports_optional_idempotency(tmp_path):
     fresh = client.post("/api/smart/retry/22", headers=headers).get_json()["job_id"]
     assert first == second
     assert fresh != first
+
+
+def test_retry_import_api_only_recovers_prepared_import_without_submission(tmp_path):
+    store = Store(tmp_path / "x.db")
+    client = create_api(store, "secret").test_client()
+    headers = {"Authorization": "Bearer secret"}
+    job = store.enqueue_job(7, "prepared")
+    attempt = store.add_attempt(job, "youtube", "candidate")
+    store.update_attempt(attempt, verdict="manual_accepted", staged_path="/stage/a.m4a")
+    store.prepare_import(job, 10, "/visible/a.m4a")
+    store.update_job(job, "import_attention", "manual import failed before submission")
+
+    response = client.post(f"/api/smart/jobs/{job}/retry-import", headers=headers)
+    assert response.status_code == 202
+    saved = store.get_job(job)
+    assert saved["status"] == "ready_import"
+    assert saved["import_phase"] is None and saved["import_result"] is None
+    assert saved["submitted_path"] is None and saved["prior_track_file_id"] is None
+    assert store.get_attempt(attempt)["staged_path"] == "/stage/a.m4a"
+
+    submitted = store.enqueue_job(8, "submitted")
+    store.prepare_import(submitted, 10, "/visible/b.m4a")
+    store.mark_import_submitted(submitted, {"status": "queued"})
+    store.update_job(submitted, "import_attention", "outcome unknown")
+    assert client.post(f"/api/smart/jobs/{submitted}/retry-import", headers=headers).status_code == 409
+
+    unknown = store.enqueue_job(9, "unknown")
+    store.prepare_import(unknown, 10, "/visible/c.m4a")
+    store.record_import_result(unknown, {"outcome": "unknown"})
+    store.update_job(unknown, "import_attention", "outcome unknown")
+    assert client.post(f"/api/smart/jobs/{unknown}/retry-import", headers=headers).status_code == 409
+    assert client.post(f"/api/smart/jobs/{job}/retry-import").status_code == 401

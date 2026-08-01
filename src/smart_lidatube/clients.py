@@ -32,6 +32,9 @@ class LidarrClient:
     def get_track(self, track_id):
         return self._get(f"track/{track_id}")
 
+    def get_album(self, album_id):
+        return self._get(f"album/{album_id}")
+
     def get_track_file(self, file_id):
         return self._get(f"trackfile/{file_id}")
 
@@ -216,19 +219,40 @@ class LidarrClient:
         }
 
     @staticmethod
-    def _release_id(track):
+    def _release_id(track, album=None):
         direct = track.get("albumReleaseId")
         if direct:
             return direct
-        album = track.get("album") or {}
+        album = album if album is not None else track.get("album") or {}
         releases = album.get("releases", []) if isinstance(album, dict) else []
-        monitored = next((item for item in releases if item.get("monitored")), None)
-        selected = monitored or (releases[0] if releases else None)
-        return selected.get("id") if selected else None
+        valid = [release for release in releases if release.get("id") not in (None, "")]
+        monitored = [release for release in valid if release.get("monitored")]
+        if monitored:
+            return sorted(monitored, key=lambda release: str(release["id"]))[0]["id"]
+        official = [
+            release for release in valid
+            if str(release.get("status", "")).casefold() == "official"
+        ]
+        if official:
+            return sorted(official, key=lambda release: str(release["id"]))[0]["id"]
+        return None
+
+    def _manual_import_release_id(self, track):
+        release_id = self._release_id(track)
+        if release_id:
+            return release_id
+        album_id = track.get("albumId")
+        if album_id in (None, ""):
+            return None
+        album = self.get_album(album_id)
+        release_id = self._release_id(track, album)
+        if release_id:
+            return release_id
+        raise ValueError(f"manual import album {album_id} has no releases suitable for import")
 
     def manual_import(self, path, track):
         required = {"id": track.get("id"), "artistId": track.get("artistId"),
-                    "albumId": track.get("albumId"), "albumReleaseId": self._release_id(track)}
+                    "albumId": track.get("albumId"), "albumReleaseId": self._manual_import_release_id(track)}
         if any(value in (None, "") for value in required.values()):
             raise ValueError("manual import requires track, artist, album and release IDs")
         try:
@@ -242,7 +266,7 @@ class LidarrClient:
             "name": track.get("title", ""),
             "artistId": track.get("artistId"),
             "albumId": track.get("albumId"),
-            "albumReleaseId": self._release_id(track),
+            "albumReleaseId": required["albumReleaseId"],
             "quality": {},
             "releaseGroup": "",
             "indexerFlags": 0,

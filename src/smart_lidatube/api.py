@@ -35,6 +35,15 @@ def register_api(app, store, token):
         job = store.enqueue_job(track_id, key, mode)
         return jsonify(job_id=job, idempotency_key=key), 202
 
+    @app.post("/api/smart/jobs/<int:job_id>/retry-import")
+    @auth
+    def retry_import(job_id):
+        if store.retry_prepared_import(job_id):
+            return jsonify(job_id=job_id, status="ready_import"), 202
+        if not store.get_job(job_id):
+            return jsonify(error="not found"), 404
+        return jsonify(error="only an unsubmitted prepared import in import_attention may be retried"), 409
+
     @app.get("/api/smart/jobs/<int:job_id>")
     @auth
     def job(job_id):

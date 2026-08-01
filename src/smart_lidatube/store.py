@@ -120,6 +120,21 @@ class Store:
         self.prepare_import(job_id, prior_file_id, path)
         self.mark_import_submitted(job_id, result)
 
+    def retry_prepared_import(self, job_id):
+        """Safely requeue only a known-unsubmitted prepared import."""
+        with self._connect() as c:
+            changed = c.execute(
+                """UPDATE retry_jobs SET status='ready_import',last_error=NULL,
+                claim_token=NULL,claimed_at=NULL,prior_track_file_id=NULL,
+                submitted_path=NULL,import_result=NULL,import_started_at=NULL,
+                import_phase=NULL,import_prepared_at=NULL,import_submitted_at=NULL,
+                import_checked_at=NULL,updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND status='import_attention' AND import_phase='prepared'
+                AND import_result IS NULL AND import_submitted_at IS NULL""",
+                (job_id,),
+            ).rowcount
+        return bool(changed)
+
     def record_import_result(self,job_id,result):
         with self._connect() as c:c.execute("UPDATE retry_jobs SET import_result=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(json.dumps(result),job_id))
 
