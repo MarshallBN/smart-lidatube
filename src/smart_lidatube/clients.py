@@ -128,13 +128,15 @@ class LidarrClient:
             return None
         artists = self._records(self._get("artist/lookup", term=artist_name))
         wanted_artist = self._normalized_metadata(artist_name)
-        artists = [artist for artist in artists if self._normalized_metadata(
-            artist.get("artistName") or artist.get("name")) == wanted_artist]
+        artists = [
+            artist for artist in artists
+            if self._normalized_metadata(artist.get("artistName") or artist.get("name")) == wanted_artist
+            and isinstance(artist.get("id"), int)
+            and not isinstance(artist.get("id"), bool)
+        ]
         if len(artists) != 1:
             return None
-        artist_id = artists[0].get("id")
-        if artist_id is None:
-            return None
+        artist_id = artists[0]["id"]
         wanted_album = self._normalized_metadata(album_title)
         albums = [album for album in self._paginated("album", artistId=artist_id)
                   if self._normalized_metadata(album.get("title")) == wanted_album]
