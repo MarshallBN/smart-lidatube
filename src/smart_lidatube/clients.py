@@ -274,12 +274,14 @@ class LidarrClient:
             "additionalFile": False,
             "replaceExistingFiles": True,
             "disableReleaseSwitching": False,
-            "rejections": [],
         }
+        # Discovery rejections are Lidarr validation output, not client-settable
+        # selection fields.  Sending them back can make Lidarr reject an otherwise
+        # explicitly mapped import.
+        body.pop("rejections", None)
         body.update({"id": track["id"], "trackIds": [track["id"]], "path": str(path),
                      "name": track.get("title", ""), **required,
-                     "replaceExistingFiles": True, "disableReleaseSwitching": False,
-                     "rejections": []})
+                     "replaceExistingFiles": True, "disableReleaseSwitching": False})
         response = self.session.post(
             f"{self.base}/api/v1/manualimport",
             json=[body],
@@ -288,9 +290,28 @@ class LidarrClient:
         )
         response.raise_for_status()
         try:
-            return response.json()
+            result = response.json()
         except (ValueError, AttributeError):
             return None
+        rejections = self._manual_import_rejections(result)
+        if rejections:
+            raise ValueError("Lidarr manual import rejected: " + "; ".join(rejections))
+        return result
+
+    @staticmethod
+    def _manual_import_rejections(result):
+        """Extract only Lidarr's explicit candidate-validation messages."""
+        candidates = result if isinstance(result, list) else [result]
+        messages = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            for rejection in candidate.get("rejections") or []:
+                if isinstance(rejection, dict):
+                    rejection = rejection.get("reason") or rejection.get("message")
+                if isinstance(rejection, str) and rejection.strip():
+                    messages.append(rejection.strip())
+        return messages
 
     def import_succeeded(self, result):
         """Reject an explicit Lidarr failure; async queued responses are successful."""

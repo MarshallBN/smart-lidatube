@@ -1,3 +1,5 @@
+import pytest
+
 from smart_lidatube.clients import LidarrClient, NavidromeClient
 
 
@@ -16,6 +18,51 @@ def test_lidarr_manual_import_replace_body():
     body=calls[0][1]["json"][0]
     assert body["replaceExistingFiles"] is True and body["path"].startswith("/lidatube/downloads/.smart-staging/")
     assert calls[0][0][0].endswith("/api/v1/manualimport")
+
+
+def test_lidarr_manual_import_omits_discovery_rejections_and_fails_on_returned_rejections():
+    candidate = {
+        "path": "/stage/godzilla.m4a", "quality": {"quality": {"id": 7}},
+        "rejections": ["Album match is not close enough", "Has missing tracks"],
+    }
+
+    class Session:
+        def __init__(self):
+            self.body = None
+
+        def get(self, url, **kwargs):
+            return Response([candidate])
+
+        def post(self, url, **kwargs):
+            self.body = kwargs["json"][0]
+            return Response([candidate], 202)
+
+    session = Session()
+    track = {"id": 242282, "title": "Godzilla", "artistId": 1318,
+             "albumId": 22984, "albumReleaseId": 20}
+    with pytest.raises(ValueError, match="Album match is not close enough; Has missing tracks"):
+        LidarrClient("http://lidarr", "key", session=session).manual_import(
+            "/stage/godzilla.m4a", track
+        )
+    assert "rejections" not in session.body
+
+
+def test_lidarr_manual_import_accepts_returned_candidate_without_rejections():
+    candidate = {"path": "/stage/song.m4a", "quality": {"quality": {"id": 7}}}
+
+    class Session:
+        def get(self, url, **kwargs):
+            return Response([candidate])
+
+        def post(self, url, **kwargs):
+            assert "rejections" not in kwargs["json"][0]
+            return Response([candidate], 202)
+
+    track = {"id": 1, "title": "Song", "artistId": 2, "albumId": 3,
+             "albumReleaseId": 4}
+    assert LidarrClient("http://lidarr", "key", session=Session()).manual_import(
+        "/stage/song.m4a", track
+    ) == [candidate]
 
 
 def test_lidarr_manual_import_looks_up_album_release_when_track_omits_it():
