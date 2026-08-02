@@ -33,6 +33,16 @@ def test_playlist_removes_only_after_durable_enqueue(tmp_path):
     assert nav.removed == ("p",0)
 
 
+def test_audit_review_api_actions_are_authenticated_and_reversible(tmp_path):
+    store = Store(tmp_path / "x.db")
+    client = create_api(store, "secret").test_client()
+    headers = {"Authorization": "Bearer secret"}
+    assert client.post("/api/smart/audit/7/ignore", headers=headers).status_code == 202
+    assert store.get_audit_track(7)["do_not_upgrade"] == 1
+    assert client.post("/api/smart/audit/7/later", headers=headers).status_code == 202
+    assert store.get_audit_track(7)["do_not_upgrade"] == 0
+
+
 def test_token_authenticated_retry_api(tmp_path):
     s=Store(tmp_path/"x.db"); app=create_api(s,"secret"); client=app.test_client()
     assert client.post("/api/smart/retry/22").status_code == 401

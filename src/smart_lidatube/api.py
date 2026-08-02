@@ -57,6 +57,19 @@ def register_api(app, store, token):
     def audit_status():
         return jsonify(audit=store.audit_status())
 
+    @app.post("/api/smart/audit/<int:track_id>/ignore")
+    @auth
+    def ignore_audit_track(track_id):
+        # Reversible, track-scoped deferral. It cannot import or mutate media.
+        store.set_audit_exemption(track_id, do_not_upgrade=True)
+        return jsonify(track_id=track_id, do_not_upgrade=True), 202
+
+    @app.post("/api/smart/audit/<int:track_id>/later")
+    @auth
+    def audit_later(track_id):
+        store.set_audit_exemption(track_id, do_not_upgrade=False)
+        return jsonify(track_id=track_id, do_not_upgrade=False), 202
+
     @app.get("/health")
     def health():
         return jsonify(status="ok")
