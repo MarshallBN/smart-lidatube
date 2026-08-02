@@ -7,6 +7,7 @@ from smart_lidatube.retry import PlaylistPoller
 from smart_lidatube.store import Store
 from smart_lidatube.telegram import TelegramBot
 from smart_lidatube.worker import JobWorker
+from smart_lidatube.api import create_api
 
 
 class Response:
@@ -231,6 +232,57 @@ def test_audit_origin_sends_verified_recording_match_without_edition_evidence_to
     assert worker.process_once() == job
     assert len(sent) == 1
     assert store.list_attempts(job)[0]["verdict"] == "awaiting_review"
+
+
+def test_audit_origin_without_telegram_is_reviewable_through_api_after_verified_staging(tmp_path):
+    store = Store(tmp_path / "smart.db")
+    job = store.enqueue_job(1, "audit-api-review", metadata={"audit_remediation": "recording_mismatch"})
+
+    class Lidarr:
+        def get_track(self, track_id): return {"id": track_id, "trackFileId": 4, "title": "Song", "artist": {"artistName": "Artist"}}
+        def get_track_file(self, file_id): return {"id": file_id, "mediaInfo": {"audioFormat": "MP3"}}
+        def track_identity(self, track): return {"recording_id": "expected", "artist": "Artist", "title": "Song", "track_file_id": 4}
+        def manual_import(self, *args): raise AssertionError("review is handled by the API")
+    class Sources:
+        def search(self, *args): return [{"provider": "youtube", "source_id": "x"}]
+        def download(self, candidate, directory):
+            directory.mkdir(parents=True, exist_ok=True); path = directory / "x"; path.write_bytes(b"audio"); return path
+    class Verifier:
+        def verify_file(self, path, identity): return type("V", (), {"verdict": "accepted", "reason": "recording_match", "evidence": {"actual_duration": 200}})()
+
+    assert JobWorker(store, Lidarr(), Sources(), Verifier(), tmp_path).process_once() == job
+    attempt = store.list_attempts(job)[0]
+    assert attempt["verdict"] == "awaiting_review"
+    assert attempt["artifact_manifest"]
+    assert store.get_job(job)["status"] == "awaiting_review"
+
+    response = create_api(store, "secret").test_client().post(
+        f"/api/smart/audit/attempts/{attempt['id']}/review",
+        json={"action": "accept"}, headers={"Authorization": "Bearer secret"},
+    )
+
+    assert response.status_code == 202
+    assert store.get_attempt(attempt["id"])["verdict"] == "manual_accepted"
+    assert store.get_job(job)["status"] == "ready_import"
+
+
+def test_non_audit_job_without_telegram_remains_review_unavailable(tmp_path):
+    store = Store(tmp_path / "smart.db")
+    job = store.enqueue_job(1, "ordinary-review", mode="manual")
+
+    class Lidarr:
+        def get_track(self, track_id): return {"id": track_id, "title": "Song", "artist": {"artistName": "Artist"}}
+        def track_identity(self, track): return {"artist": "Artist", "title": "Song"}
+    class Sources:
+        def search(self, *args): return [{"provider": "youtube", "source_id": "x"}]
+        def download(self, candidate, directory):
+            directory.mkdir(parents=True, exist_ok=True); path = directory / "x"; path.write_bytes(b"audio"); return path
+    class Verifier:
+        def verify_file(self, path, identity): return type("V", (), {"verdict": "accepted", "reason": "match", "evidence": {}})()
+
+    assert JobWorker(store, Lidarr(), Sources(), Verifier(), tmp_path).process_once() == job
+    assert store.list_attempts(job)[0]["verdict"] == "review_unavailable"
+    assert store.get_job(job)["status"] == "review_unavailable"
 
 
 def test_audit_review_actions_are_distinct_one_shot_and_safe(tmp_path):

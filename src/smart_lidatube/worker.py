@@ -263,6 +263,10 @@ class JobWorker:
 
     def _request_review(self, job, attempt_id, candidate, verification):
         if not self.telegram or self.review_chat_id is None:
+            if job.get("metadata", {}).get("audit_remediation"):
+                self.store.update_attempt(attempt_id, verdict="awaiting_review")
+                self.store.update_job(job["id"], "awaiting_review")
+                return
             self.store.update_attempt(attempt_id, verdict="review_unavailable")
             self.store.update_job(
                 job["id"], "review_unavailable",
