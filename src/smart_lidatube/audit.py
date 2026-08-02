@@ -64,7 +64,14 @@ class AuditWorker:
             if track.get("id") is not None and track.get("trackFileId"):
                 self.store.upsert_audit_track(track["id"])
                 added += 1
-        self.store.set_setting("audit_bootstrap_cursor", next_cursor if next_cursor is not None else 1)
+        # A successful but unusable first /track page leaves a new ledger
+        # permanently empty on affected Lidarr builds.  Fail closed into the
+        # client's read-only trackfile enumeration only before any rows exist;
+        # later empty pages are ordinary pagination completion, not a fallback.
+        if cursor == 1 and not added and not self.store.audit_status()["total"]:
+            self.store.set_setting("audit_bootstrap_cursor", "files:1")
+        else:
+            self.store.set_setting("audit_bootstrap_cursor", next_cursor if next_cursor is not None else 1)
         return added
 
     def process_once(self):
