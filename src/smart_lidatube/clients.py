@@ -38,13 +38,37 @@ class LidarrClient:
         return self._get(f"trackfile/{file_id}")
 
     def list_audit_tracks(self, cursor=1, limit=100):
-        """Read one bounded page of organized tracks for the audit ledger."""
-        payload = self._get("track", page=int(cursor), pageSize=int(limit))
+        """Read one bounded organized-track page without making any mutations.
+
+        Older/current Lidarr builds differ on whether ``/track`` supports the
+        page envelope.  The ``files:N`` cursor is a deliberately read-only
+        fallback: enumerate one page of track files and resolve only those
+        file IDs through the supported filtered track endpoint.
+        """
+        if str(cursor).startswith("files:"):
+            page = int(str(cursor).split(":", 1)[1])
+            payload = self._get("trackfile", page=page, pageSize=int(limit))
+            files = self._records(payload)
+            tracks = []
+            for track_file in files:
+                file_id = track_file.get("id")
+                if file_id is None:
+                    continue
+                matches = self._records(self._get("track", trackFileId=file_id))
+                matches = [track for track in matches if track.get("trackFileId") == file_id]
+                if len(matches) == 1:
+                    tracks.append(matches[0])
+            if not isinstance(payload, dict):
+                return tracks, None
+            total = int(payload.get("totalRecords", len(files)))
+            return tracks, f"files:{page + 1}" if page * int(limit) < total else None
+        page = int(cursor)
+        payload = self._get("track", page=page, pageSize=int(limit))
         tracks = self._records(payload)
         if not isinstance(payload, dict):
             return tracks, None
         total = int(payload.get("totalRecords", len(tracks)))
-        next_cursor = int(cursor) + 1 if int(cursor) * int(limit) < total else None
+        next_cursor = page + 1 if page * int(limit) < total else None
         return tracks, next_cursor
 
     def delete_track_file(self, file_id):

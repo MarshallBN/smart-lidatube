@@ -48,8 +48,17 @@ class AuditWorker:
         enumerate_tracks = getattr(self.lidarr, "list_audit_tracks", None)
         if not enumerate_tracks:
             return 0
-        cursor = int(self.store.get_setting("audit_bootstrap_cursor", "1"))
-        tracks, next_cursor = enumerate_tracks(cursor, self.config.bootstrap_batch_size)
+        raw_cursor = self.store.get_setting("audit_bootstrap_cursor", "1")
+        cursor = raw_cursor if raw_cursor.startswith("files:") else int(raw_cursor)
+        try:
+            tracks, next_cursor = enumerate_tracks(cursor, self.config.bootstrap_batch_size)
+        except Exception:
+            # Some Lidarr builds do not support paginating /track.  Switch to
+            # the client's read-only trackfile-backed strategy on the next
+            # bounded cycle instead of repeatedly failing before any ledger row.
+            if not isinstance(cursor, str):
+                self.store.set_setting("audit_bootstrap_cursor", "files:1")
+            return 0
         added = 0
         for track in tracks:
             if track.get("id") is not None and track.get("trackFileId"):

@@ -108,6 +108,28 @@ def test_lidarr_manual_import_uses_deterministic_official_release_or_fails_witho
         LidarrClient("http://lidarr", "key", session=Session([])).manual_import("/stage/a.m4a", track)
 
 
+def test_lidarr_audit_enumeration_uses_read_only_trackfile_fallback_when_track_paging_is_unavailable():
+    calls = []
+
+    class Session:
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs.get("params")))
+            params = kwargs.get("params") or {}
+            if url.endswith("/trackfile"):
+                assert params == {"page": 1, "pageSize": 2}
+                return Response({"records": [{"id": 10}, {"id": 11}], "totalRecords": 3})
+            if url.endswith("/track"):
+                file_id = params["trackFileId"]
+                return Response([{"id": file_id + 100, "trackFileId": file_id}])
+            raise AssertionError(url)
+
+    client = LidarrClient("http://lidarr", "key", session=Session())
+    tracks, next_cursor = client.list_audit_tracks("files:1", 2)
+    assert tracks == [{"id": 110, "trackFileId": 10}, {"id": 111, "trackFileId": 11}]
+    assert next_cursor == "files:2"
+    assert all("command" not in url for url, _ in calls)
+
+
 def test_lidarr_resolve_and_delete_file_api():
     calls=[]
     session=type("S",(),{"get":lambda s,url,**k:Response({"id":7,"trackFileId":9}), "delete":lambda s,url,**k:(calls.append(url) or Response()), "post":lambda *a,**k:Response(status=202)})()

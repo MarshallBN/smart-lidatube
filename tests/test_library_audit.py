@@ -118,6 +118,29 @@ def test_bootstrap_discovers_lidarr_library_in_bounded_batches_without_side_effe
     assert lidarr.calls == [(1, 2), (2, 2)]
 
 
+def test_bootstrap_falls_back_to_bounded_trackfile_enumeration_when_track_paging_is_unsupported(tmp_path):
+    class Lidarr:
+        def __init__(self):
+            self.calls = []
+
+        def list_audit_tracks(self, cursor, limit):
+            self.calls.append((cursor, limit))
+            if cursor == 1:
+                raise RuntimeError("track endpoint rejects pagination")
+            assert cursor == "files:1"
+            return ([{"id": 21, "trackFileId": 201}], None)
+
+    store = Store(tmp_path / "audit.db")
+    lidarr = Lidarr()
+    worker = AuditWorker(store, lidarr, object(), AuditConfig(bootstrap_batch_size=2))
+    assert worker.bootstrap_once() == 0
+    # The fallback cursor is durable; the next bounded read completes bootstrap.
+    assert store.get_setting("audit_bootstrap_cursor") == "files:1"
+    assert worker.bootstrap_once() == 1
+    assert store.get_audit_track(21) is not None
+    assert lidarr.calls == [(1, 2), ("files:1", 2)]
+
+
 def test_token_is_not_consumed_until_a_candidate_exists(tmp_path):
     store = Store(tmp_path / "audit.db")
     clock = lambda: datetime(2026, 1, 1)
