@@ -30,15 +30,17 @@ class RemediationDispatcher:
         return True
 
     def dispatch_once(self):
-        if self.store.regular_work_pending() or not self._token():
+        if self.store.regular_work_pending():
             return None
         item = self.store.claim_remediation()
         if not item:
             return None
-        job_id = self.store.enqueue_job(
-            item["lidarr_track_id"],
+        if not self._token():
+            self.store.release_remediation(item["id"])
+            return None
+        job_id = self.store.create_remediation_job(
+            item,
             f"audit-remediation:{item['lidarr_track_id']}:{uuid4()}",
-            mode="manual",
-            metadata={"audit_remediation": item["reason"]},
+            {"audit_remediation": item["reason"]},
         )
         return job_id

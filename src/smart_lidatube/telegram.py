@@ -34,24 +34,25 @@ class TelegramBot:
     def send_review(self, chat_id, attempt_id, text):
         if int(chat_id) not in self.allowed_chats:
             return False
-        keyboard = [
+        attempt = self.store.get_attempt(attempt_id)
+        job = self.store.get_job(attempt["job_id"]) if attempt else None
+        audit = bool(job and job.get("metadata", {}).get("audit_remediation"))
+        keyboard = ([
             [
-                {
-                    "text": "Accept",
-                    "callback_data": f"attempt:{attempt_id}:accept",
-                },
-                {
-                    "text": "Reject / next",
-                    "callback_data": f"attempt:{attempt_id}:reject",
-                },
+                {"text": "Accept replacement", "callback_data": f"attempt:{attempt_id}:accept"},
+                {"text": "Reject candidate", "callback_data": f"attempt:{attempt_id}:reject"},
             ],
             [
-                {
-                    "text": "Cancel job",
-                    "callback_data": f"attempt:{attempt_id}:cancel",
-                }
+                {"text": "Ignore track", "callback_data": f"attempt:{attempt_id}:ignore_track"},
+                {"text": "Audit later", "callback_data": f"attempt:{attempt_id}:audit_later"},
             ],
-        ]
+        ] if audit else [
+            [
+                {"text": "Accept", "callback_data": f"attempt:{attempt_id}:accept"},
+                {"text": "Reject / next", "callback_data": f"attempt:{attempt_id}:reject"},
+            ],
+            [{"text": "Cancel job", "callback_data": f"attempt:{attempt_id}:cancel"}],
+        ])
         self.request(
             "sendMessage",
             {
@@ -115,10 +116,20 @@ class TelegramBot:
             attempt_id = int(raw_id)
         except (KeyError, ValueError):
             return False
-        if prefix != "attempt" or action not in ("accept", "reject", "cancel"):
+        if prefix != "attempt":
             return False
         evidence = {"telegram_user_id": user, "telegram_chat_id": chat}
-        accepted = self.store.apply_review(attempt_id, action, evidence)
+        attempt = self.store.get_attempt(attempt_id)
+        job = self.store.get_job(attempt["job_id"]) if attempt else None
+        audit = bool(job and job.get("metadata", {}).get("audit_remediation"))
+        if audit:
+            if action not in ("accept", "reject", "ignore_track", "audit_later"):
+                return False
+            accepted = self.store.apply_audit_review(attempt_id, action, evidence)
+        else:
+            if action not in ("accept", "reject", "cancel"):
+                return False
+            accepted = self.store.apply_review(attempt_id, action, evidence)
         text = ("Review accepted." if accepted is not None else
                 "This review was already handled or is stale.")
         self.request("answerCallbackQuery", {

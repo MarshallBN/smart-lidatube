@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from smart_lidatube.retry import filter_candidates
+from smart_lidatube.quality import quality_decision
 
 
 def translate_staged_path(path, downloads_root, lidarr_downloads_root):
@@ -176,6 +177,8 @@ class JobWorker:
                 identity["current_track_file"] = self.lidarr.get_track_file(file_id)
             except Exception as exc:
                 identity["current_track_file_error"] = str(exc)
+        audit_origin = bool(job.get("metadata", {}).get("audit_remediation"))
+        current_quality = self._current_quality(identity, job["lidarr_track_id"])
         candidates = filter_candidates(
             self.store, job["lidarr_track_id"],
             self.sources.search(identity["artist"], identity["title"]),
@@ -198,6 +201,25 @@ class JobWorker:
                 )
                 raise
             verification = self.verifier.verify_file(staged, identity)
+            if audit_origin:
+                decision = quality_decision(
+                    current_quality,
+                    verification.evidence or {},
+                    edition_match=(verification.evidence or {}).get("edition_match") is True,
+                    identity_verified=verification.verdict == "accepted",
+                )
+                if decision == "rejected":
+                    self.store.update_attempt(
+                        attempt_id,
+                        verdict="rejected",
+                        evidence={"reason": "audit_quality_policy", **verification.evidence},
+                        staged_path=staged,
+                    )
+                    self.store.reject(
+                        job["lidarr_track_id"], candidate["provider"],
+                        candidate["source_id"], attempt_id,
+                    )
+                    continue
             self.store.update_attempt(
                 attempt_id, verdict=verification.verdict,
                 evidence={"reason": verification.reason, **verification.evidence},
@@ -209,12 +231,25 @@ class JobWorker:
                     candidate["source_id"], attempt_id,
                 )
                 continue
-            if verification.verdict == "accepted" and job["mode"] == "auto":
+            if audit_origin and verification.verdict == "accepted":
+                self.store.capture_artifact_manifest(attempt_id, staged)
+            if verification.verdict == "accepted" and job["mode"] == "auto" and not audit_origin:
                 self._import(job, track, self.store.get_attempt(attempt_id))
                 return
             self._request_review(job, attempt_id, candidate, verification)
             return
         self.store.update_job(job["id"], "exhausted", error="no candidates remain")
+
+    def _current_quality(self, identity, track_id):
+        """Use Lidarr's track-file facts only; never infer quality from its path."""
+        current = identity.get("current_track_file") or {}
+        media = current.get("mediaInfo") or {}
+        return {
+            "verified": bool(identity.get("recording_id"))
+            and not identity.get("current_track_file_error")
+            and bool((self.store.get_audit_track(track_id) or {}).get("status") == "verified"),
+            "codec": media.get("audioFormat") or media.get("audioCodec"),
+        }
 
     def _accepted_attempt(self, job_id):
         return next(
@@ -255,6 +290,9 @@ class JobWorker:
         return re.sub(r"(?i)(https?://[^/@\s]+:)[^@\s]+@", r"\1***@", str(exc))
 
     def _import(self, job, track, attempt):
+        if job.get("metadata", {}).get("audit_remediation") and not self.store.artifact_manifest_matches(attempt):
+            self.store.update_job(job["id"], "import_attention", error="audit staged artifact integrity check failed")
+            return
         local = Path(attempt.get("staged_path") or "")
         if not local.is_file() or local.stat().st_size <= 0:
             raise RuntimeError("accepted staged candidate is missing")

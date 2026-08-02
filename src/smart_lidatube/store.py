@@ -1,6 +1,7 @@
 """Durable, concurrency-safe SQLite state for smart retries."""
 import json
 import sqlite3
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -28,7 +29,7 @@ class Store:
             CREATE INDEX IF NOT EXISTS library_audit_eligible ON library_audit_tracks(do_not_audit,next_check_at,priority_score,last_checked_at);
             CREATE TABLE IF NOT EXISTS library_audit_events(id INTEGER PRIMARY KEY,lidarr_track_id INTEGER NOT NULL REFERENCES library_audit_tracks(lidarr_track_id),event_type TEXT NOT NULL,result_status TEXT NOT NULL,evidence_json TEXT NOT NULL DEFAULT '{}',audit_local_day TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
             CREATE INDEX IF NOT EXISTS library_audit_events_report ON library_audit_events(audit_local_day,result_status,lidarr_track_id);
-            CREATE TABLE IF NOT EXISTS remediation_queue(id INTEGER PRIMARY KEY,lidarr_track_id INTEGER NOT NULL UNIQUE,reason TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'eligible',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+            CREATE TABLE IF NOT EXISTS remediation_queue(id INTEGER PRIMARY KEY,lidarr_track_id INTEGER NOT NULL UNIQUE,reason TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'eligible',job_id INTEGER REFERENCES retry_jobs(id),created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
             CREATE INDEX IF NOT EXISTS remediation_queue_eligible ON remediation_queue(status,id);
             """)
             self._add_columns(c, "retry_jobs", {
@@ -42,7 +43,8 @@ class Store:
                 "notification_chat_id": "INTEGER", "notification_text": "TEXT",
                 "notification_evidence": "TEXT",
             })
-            self._add_columns(c,"source_attempts",{"staged_path":"TEXT","updated_at":"TEXT"})
+            self._add_columns(c,"source_attempts",{"staged_path":"TEXT","updated_at":"TEXT","artifact_manifest":"TEXT"})
+            self._add_columns(c,"remediation_queue",{"job_id":"INTEGER REFERENCES retry_jobs(id)"})
             self._add_columns(c,"library_audit_events",{"audit_local_day":"TEXT"})
             # Rebuild this index after adding the local-day reporting key.
             c.execute("DROP INDEX IF EXISTS library_audit_events_report")
@@ -90,13 +92,17 @@ class Store:
             return c.execute("UPDATE retry_jobs SET status=CASE WHEN EXISTS(SELECT 1 FROM source_attempts a WHERE a.job_id=retry_jobs.id AND a.verdict='manual_accepted') THEN 'ready_import' ELSE 'queued' END,claim_token=NULL,claimed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE status='processing' AND claimed_at < datetime('now',?)",(f"-{int(seconds)} seconds",)).rowcount
 
     def update_job(self,job_id,status,error=None):
-        with self._connect() as c:c.execute("UPDATE retry_jobs SET status=?,last_error=?,claim_token=NULL,claimed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",(status,error,job_id))
+        with self._connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("UPDATE retry_jobs SET status=?,last_error=?,claim_token=NULL,claimed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",(status,error,job_id))
+            c.execute("UPDATE remediation_queue SET status=?,updated_at=CURRENT_TIMESTAMP WHERE job_id=?",(status,job_id))
 
     def schedule_retry(self,job_id,error,delay=30,max_attempts=5):
         with self._connect() as c:
             row=c.execute("SELECT retry_count FROM retry_jobs WHERE id=?",(job_id,)).fetchone(); count=row[0]+1
             status="failed" if count>=max_attempts else "queued"
             c.execute("UPDATE retry_jobs SET status=?,retry_count=?,next_attempt_at=datetime('now',?),last_error=?,claim_token=NULL,claimed_at=NULL WHERE id=?",(status,count,f"+{int(delay)} seconds",error,job_id))
+            c.execute("UPDATE remediation_queue SET status=?,updated_at=CURRENT_TIMESTAMP WHERE job_id=?",(status,job_id))
 
     def prepare_import(self, job_id, prior_file_id, path):
         with self._connect() as c:
@@ -167,6 +173,7 @@ class Store:
                 updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                 (attempt_id, chat_id, text, json.dumps(evidence), job_id),
             )
+            c.execute("UPDATE remediation_queue SET status='notification_pending',updated_at=CURRENT_TIMESTAMP WHERE job_id=?",(job_id,))
 
     def list_pending_notifications(self):
         with self._connect() as c:
@@ -189,6 +196,7 @@ class Store:
                     "UPDATE source_attempts SET verdict='awaiting_review',updated_at=CURRENT_TIMESTAMP WHERE id=? AND job_id=? AND verdict='notification_pending'",
                     (attempt_id, job_id),
                 )
+                c.execute("UPDATE remediation_queue SET status='awaiting_review',updated_at=CURRENT_TIMESTAMP WHERE job_id=?",(job_id,))
             return bool(changed)
 
     def list_jobs_for_track(self, track_id):
@@ -207,17 +215,37 @@ class Store:
 
     def get_attempt(self,attempt_id):
         with self._connect() as c:r=c.execute("SELECT * FROM source_attempts WHERE id=?",(attempt_id,)).fetchone()
-        return self._decode(r,("provenance","evidence")) if r else None
+        return self._decode(r,("provenance","evidence","artifact_manifest")) if r else None
 
     def list_attempts(self,job_id):
         with self._connect() as c:rows=c.execute("SELECT * FROM source_attempts WHERE job_id=? ORDER BY id",(job_id,)).fetchall()
-        return [self._decode(r,("provenance","evidence")) for r in rows]
+        return [self._decode(r,("provenance","evidence","artifact_manifest")) for r in rows]
 
     def update_attempt(self,attempt_id,verdict=None,evidence=None,staged_path=None):
         fields=["updated_at=CURRENT_TIMESTAMP"]; vals=[]
         for name,value in (("verdict",verdict),("evidence",json.dumps(evidence) if evidence is not None else None),("staged_path",str(staged_path) if staged_path is not None else None)):
             if value is not None:fields.append(f"{name}=?");vals.append(value)
         with self._connect() as c:c.execute(f"UPDATE source_attempts SET {','.join(fields)} WHERE id=?",(*vals,attempt_id))
+
+    @staticmethod
+    def _artifact_manifest(path):
+        path=Path(path).resolve(strict=True)
+        return {"path":str(path),"size":path.stat().st_size,"sha256":hashlib.sha256(path.read_bytes()).hexdigest()}
+
+    def capture_artifact_manifest(self, attempt_id, path):
+        manifest=self._artifact_manifest(path)
+        with self._connect() as c:
+            c.execute("UPDATE source_attempts SET artifact_manifest=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(json.dumps(manifest),attempt_id))
+        return manifest
+
+    def artifact_manifest_matches(self, attempt):
+        manifest=attempt.get("artifact_manifest")
+        if not isinstance(manifest,dict) or not attempt.get("staged_path"):
+            return False
+        try:
+            return manifest == self._artifact_manifest(attempt["staged_path"])
+        except (FileNotFoundError, ValueError, OSError):
+            return False
 
     def set_attempt_verdict(self,*args,**kwargs):self.update_attempt(args[0],verdict=args[1],evidence=args[2] if len(args)>2 else kwargs.get("evidence",{}))
 
@@ -229,6 +257,35 @@ class Store:
             if not row:return None
             c.execute("UPDATE source_attempts SET verdict=?,evidence=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(verdicts[action],json.dumps(evidence),attempt_id)); c.execute("UPDATE retry_jobs SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(statuses[action],row["job_id"]))
             if action=="reject":c.execute("INSERT OR IGNORE INTO source_rejections VALUES(?,?,?,?,CURRENT_TIMESTAMP)",(row["lidarr_track_id"],row["provider"],row["source_id"],attempt_id))
+            return row["job_id"]
+
+    def apply_audit_review(self, attempt_id, action, evidence):
+        """Consume an audit replacement review exactly once, with safe outcomes."""
+        outcomes = {
+            "accept": ("manual_accepted", "ready_import"),
+            "reject": ("manual_rejected", "queued"),
+            "ignore_track": ("cancelled", "cancelled"),
+            "audit_later": ("deferred", "queued"),
+        }
+        if action not in outcomes:
+            return None
+        with self._connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row=c.execute("""SELECT a.job_id,j.lidarr_track_id,a.provider,a.source_id
+                FROM source_attempts a JOIN retry_jobs j ON j.id=a.job_id
+                WHERE a.id=? AND a.verdict='awaiting_review' AND j.status='awaiting_review'
+                AND json_extract(j.metadata, '$.audit_remediation') IS NOT NULL""",(attempt_id,)).fetchone()
+            if not row:
+                return None
+            verdict, status = outcomes[action]
+            c.execute("UPDATE source_attempts SET verdict=?,evidence=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(verdict,json.dumps(evidence),attempt_id))
+            c.execute("UPDATE retry_jobs SET status=?,claim_token=NULL,claimed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",(status,row["job_id"]))
+            c.execute("UPDATE remediation_queue SET status=?,updated_at=CURRENT_TIMESTAMP WHERE job_id=?",(status,row["job_id"]))
+            if action == "reject":
+                c.execute("INSERT OR IGNORE INTO source_rejections VALUES(?,?,?,?,CURRENT_TIMESTAMP)",(row["lidarr_track_id"],row["provider"],row["source_id"],attempt_id))
+            if action == "ignore_track":
+                c.execute("INSERT INTO library_audit_tracks(lidarr_track_id) VALUES(?) ON CONFLICT(lidarr_track_id) DO NOTHING",(row["lidarr_track_id"],))
+                c.execute("UPDATE library_audit_tracks SET do_not_upgrade=1,updated_at=CURRENT_TIMESTAMP WHERE lidarr_track_id=?",(row["lidarr_track_id"],))
             return row["job_id"]
 
     def reject(self,track_id,provider,source_id,attempt_id=None):
@@ -302,6 +359,11 @@ class Store:
             row = c.execute("SELECT id FROM remediation_queue WHERE lidarr_track_id=?", (track_id,)).fetchone()
         return row["id"]
 
+    def get_remediation(self, queue_id):
+        with self._connect() as c:
+            row=c.execute("SELECT * FROM remediation_queue WHERE id=?",(queue_id,)).fetchone()
+        return dict(row) if row else None
+
     def claim_remediation(self):
         with self._connect() as c:
             c.execute("BEGIN IMMEDIATE")
@@ -309,7 +371,22 @@ class Store:
             if not row:
                 return None
             changed = c.execute("UPDATE remediation_queue SET status='searching',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='eligible'", (row["id"],)).rowcount
-            return {"lidarr_track_id": row["lidarr_track_id"], "reason": row["reason"]} if changed else None
+            return {"id": row["id"], "lidarr_track_id": row["lidarr_track_id"], "reason": row["reason"]} if changed else None
+
+    def release_remediation(self, queue_id):
+        with self._connect() as c:
+            return bool(c.execute("UPDATE remediation_queue SET status='eligible',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='searching' AND job_id IS NULL",(queue_id,)).rowcount)
+
+    def create_remediation_job(self, item, idempotency_key, metadata):
+        """Atomically attach the claimed audit queue item to its retry job."""
+        with self._connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row=c.execute("SELECT * FROM remediation_queue WHERE id=? AND status='searching' AND job_id IS NULL",(item["id"],)).fetchone()
+            if not row:
+                return None
+            job=c.execute("INSERT INTO retry_jobs(lidarr_track_id,idempotency_key,mode,metadata,prior_source) VALUES(?,?,?,?,?)",(row["lidarr_track_id"],idempotency_key,"manual",json.dumps(metadata),"unknown")).lastrowid
+            c.execute("UPDATE remediation_queue SET job_id=?,status='queued',updated_at=CURRENT_TIMESTAMP WHERE id=?",(job,row["id"]))
+            return job
 
     def audit_status(self):
         with self._connect() as c:

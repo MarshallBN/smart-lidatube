@@ -166,6 +166,86 @@ def test_manual_review_callback_resumes_or_imports(tmp_path):
     assert store.get_job(job)["status"] == "ready_import"
 
 
+def test_audit_origin_rejects_verified_lossless_current_file_before_review(tmp_path):
+    store = Store(tmp_path / "smart.db")
+    job = store.enqueue_job(1, "audit-lossless", mode="manual", metadata={"audit_remediation": "recording_mismatch"})
+    sent = []
+
+    class Lidarr:
+        def get_track(self, track_id): return {"id": track_id, "trackFileId": 4, "title": "Song", "artist": {"artistName": "Artist"}}
+        def get_track_file(self, file_id): return {"id": file_id, "mediaInfo": {"audioFormat": "FLAC"}}
+        def track_identity(self, track): return {"recording_id": "expected", "artist": "Artist", "title": "Song", "track_file_id": 4}
+    class Sources:
+        def search(self, *args): return [{"provider": "youtube", "source_id": "x"}]
+        def download(self, candidate, directory):
+            directory.mkdir(parents=True, exist_ok=True); path = directory / "x"; path.write_bytes(b"audio"); return path
+    class Verifier:
+        def verify_file(self, path, identity): return type("V", (), {"verdict": "accepted", "reason": "recording_match", "evidence": {"edition_match": True, "codec": "m4a"}})()
+
+    store.upsert_audit_track(1); store.record_audit_result(1, "verified")
+    worker = JobWorker(store, Lidarr(), Sources(), Verifier(), tmp_path, telegram=type("T", (), {"send_review": lambda *args: sent.append(args) or True})(), review_chat_id=9)
+    assert worker.process_once() == job
+    assert sent == []
+    assert store.list_attempts(job)[0]["verdict"] == "rejected"
+
+
+def test_audit_origin_rejects_uncertain_edition_and_never_auto_import(tmp_path):
+    store = Store(tmp_path / "smart.db")
+    job = store.enqueue_job(1, "audit-edition", metadata={"audit_remediation": "recording_mismatch"})
+
+    class Lidarr:
+        def get_track(self, track_id): return {"id": track_id, "trackFileId": 4, "title": "Song", "artist": {"artistName": "Artist"}}
+        def get_track_file(self, file_id): return {"id": file_id, "mediaInfo": {"audioFormat": "MP3"}}
+        def track_identity(self, track): return {"recording_id": "expected", "artist": "Artist", "title": "Song", "track_file_id": 4}
+        def manual_import(self, *args): raise AssertionError("audit work must never auto import")
+    class Sources:
+        def search(self, *args): return [{"provider": "youtube", "source_id": "x"}]
+        def download(self, candidate, directory):
+            directory.mkdir(parents=True, exist_ok=True); path = directory / "x"; path.write_bytes(b"audio"); return path
+    class Verifier:
+        def verify_file(self, path, identity): return type("V", (), {"verdict": "accepted", "reason": "recording_match", "evidence": {"edition_match": False, "codec": "m4a"}})()
+
+    worker = JobWorker(store, Lidarr(), Sources(), Verifier(), tmp_path)
+    assert worker.process_once() == job
+    assert store.list_attempts(job)[0]["verdict"] == "rejected"
+
+
+def test_audit_review_actions_are_distinct_one_shot_and_safe(tmp_path):
+    store = Store(tmp_path / "smart.db")
+    job = store.enqueue_job(1, "audit-review", mode="manual", metadata={"audit_remediation": "recording_mismatch"})
+    attempt = store.add_attempt(job, "youtube", "abc")
+    store.update_attempt(attempt, verdict="awaiting_review", staged_path="/staged/a")
+    store.update_job(job, "awaiting_review")
+    sent = []
+    bot = TelegramBot("x", store, {5}, {9}, request=lambda method, payload: sent.append((method, payload)) or {})
+    bot.send_review(9, attempt, "candidate")
+    labels = [button["text"] for row in sent[0][1]["reply_markup"]["inline_keyboard"] for button in row]
+    assert labels == ["Accept replacement", "Reject candidate", "Ignore track", "Audit later"]
+    assert bot.handle_callback({"id": "x", "from": {"id": 5}, "message": {"chat": {"id": 9}}, "data": f"attempt:{attempt}:ignore_track"})
+    assert store.get_audit_track(1)["do_not_upgrade"] == 1
+    assert store.get_job(job)["status"] == "cancelled"
+    assert not bot.handle_callback({"id": "y", "from": {"id": 5}, "message": {"chat": {"id": 9}}, "data": f"attempt:{attempt}:ignore_track"})
+
+
+def test_audit_import_rejects_staged_artifact_drift(tmp_path):
+    store = Store(tmp_path / "smart.db")
+    staged = tmp_path / ".smart-staging" / "1" / "candidate"
+    staged.parent.mkdir(parents=True); staged.write_bytes(b"verified")
+    job = store.enqueue_job(1, "audit-drift", mode="manual", metadata={"audit_remediation": "recording_mismatch"})
+    attempt = store.add_attempt(job, "youtube", "abc")
+    store.update_attempt(attempt, verdict="manual_accepted", staged_path=staged)
+    store.capture_artifact_manifest(attempt, staged)
+    store.update_job(job, "ready_import")
+    staged.write_bytes(b"drifted")
+
+    class Lidarr:
+        def get_track(self, track_id): return {"id": track_id, "title": "Song", "artist": {"artistName": "Artist"}}
+        def manual_import(self, *args): raise AssertionError("drifted artifact must not import")
+
+    assert JobWorker(store, Lidarr(), None, None, tmp_path).process_once() == job
+    assert store.get_job(job)["status"] == "import_attention"
+
+
 def test_playlist_removal_descends_and_verifies_occurrence(tmp_path):
     entries = [
         {"id": "same", "playlist_id": "p", "playlist_name": "Retry", "playlist_index": 0, "path": "A/one.mp3"},
