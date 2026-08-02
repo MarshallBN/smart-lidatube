@@ -189,3 +189,4 @@ def test_build_components_retains_three_item_public_return(monkeypatch, tmp_path
     components = build_components()
     assert len(components) == 3
     assert hasattr(components[0], "audit_worker")
+    assert hasattr(components[0], "remediation_dispatcher")

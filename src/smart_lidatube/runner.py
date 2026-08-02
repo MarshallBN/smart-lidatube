@@ -10,6 +10,7 @@ from smart_lidatube.audit import AuditConfig, AuditWorker
 from smart_lidatube.clients import LidarrClient, NavidromeClient, YouTubeClient
 from smart_lidatube.fingerprint import AcoustIDClient, FileVerifier, Fpcalc
 from smart_lidatube.retry import PlaylistPoller
+from smart_lidatube.remediation import RemediationDispatcher
 from smart_lidatube.store import Store
 from smart_lidatube.telegram import TelegramBot
 from smart_lidatube.worker import JobWorker
@@ -98,6 +99,11 @@ def build_components():
     store.set_setting("audit_budget_per_hour", audit_config.budget_per_hour)
     audit = AuditWorker(store, lidarr, verifier, audit_config)
     worker.audit_worker = audit
+    worker.remediation_dispatcher = RemediationDispatcher(
+        store,
+        budget_per_hour=int(env("SMART_AUDIT_CANDIDATE_SEARCH_BUDGET_PER_HOUR", "0")),
+        max_token_bank=int(env("SMART_AUDIT_CANDIDATE_SEARCH_MAX_TOKEN_BANK", "2")),
+    )
     return worker, poller, telegram
 
 
@@ -120,6 +126,9 @@ def run_forever():
             if not worker.store.regular_work_pending():
                 audit.bootstrap_once()
                 audit.process_once()  # only runs after retry/import work yields idle
+                # Candidate discovery is disabled by default and merely queues
+                # the existing manual, staged-and-verified review workflow.
+                worker.remediation_dispatcher.dispatch_once()
             if telegram:
                 timezone = ZoneInfo(env("SMART_AUDIT_TIMEZONE", "UTC"))
                 now = datetime.now(timezone)
