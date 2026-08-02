@@ -72,7 +72,7 @@ class AuditWorker:
         return added
 
     def process_once(self):
-        if not self.config.enabled or self.store.regular_work_pending(): return None
+        if not self.config.enabled or self.store.audit_work_pending(): return None
         row=self.store.select_audit_candidate(self.config.fairness_share)
         if not row or not self._token(): return None
         track_id=row["lidarr_track_id"]

@@ -123,7 +123,7 @@ def run_forever():
                 poller.poll_once()
             while worker.process_once() is not None:
                 pass
-            if not worker.store.regular_work_pending():
+            if not worker.store.audit_work_pending():
                 audit.bootstrap_once()
                 audit.process_once()  # only runs after retry/import work yields idle
                 # Candidate discovery is disabled by default and merely queues

@@ -349,6 +349,10 @@ class Store:
     def regular_work_pending(self):
         active=("queued","processing","ready_import","importing","import_attention","notification_pending","awaiting_review")
         with self._connect() as c:return c.execute("SELECT 1 FROM retry_jobs WHERE status IN (%s) LIMIT 1" % ",".join("?"*len(active)),active).fetchone() is not None
+    def audit_work_pending(self):
+        """Return whether automatic or destructive retry work must preempt audits."""
+        active=("queued","processing","ready_import","importing","notification_pending","awaiting_review")
+        with self._connect() as c:return c.execute("SELECT 1 FROM retry_jobs WHERE status IN (%s) LIMIT 1" % ",".join("?"*len(active)),active).fetchone() is not None
     def record_audit_result(self,track_id,status,evidence=None,next_check_at=None,marker=None,error_code=None,audit_local_day=None):
         self.upsert_audit_track(track_id); safe=self._safe_audit_evidence(evidence)
         audit_local_day = audit_local_day or datetime.now(timezone.utc).date().isoformat()

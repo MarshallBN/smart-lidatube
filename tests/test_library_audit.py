@@ -68,6 +68,43 @@ def test_budget_idle_guard_and_read_only_single_track_audit(tmp_path):
     assert worker.process_once() is None  # queued retry wins
 
 
+def test_import_attention_does_not_block_audit_bootstrap_or_processing(tmp_path):
+    class Lidarr:
+        def list_audit_tracks(self, cursor, limit):
+            assert (cursor, limit) == ("albums:0", 100)
+            return ([{"id": 8, "trackFileId": 9}], None)
+        def get_track(self, track_id):
+            return {"id": track_id, "trackFileId": 9, "title": "Song", "artist": {"artistName": "Artist"}}
+        def get_track_file(self, file_id):
+            return {"id": file_id, "path": str(tmp_path / "missing")}
+        @staticmethod
+        def track_identity(track):
+            return {"artist": "Artist", "title": "Song", "track_file_id": 9}
+
+    store = Store(tmp_path / "audit.db")
+    job = store.enqueue_job(99, "needs-human-attention")
+    store.update_job(job, "import_attention")
+    worker = AuditWorker(store, Lidarr(), object(), AuditConfig())
+
+    assert not store.audit_work_pending()
+    assert worker.bootstrap_once() == 1
+    assert worker.process_once() == 8
+
+
+def test_active_retry_and_review_jobs_still_block_audit(tmp_path):
+    for status in ("queued", "processing", "ready_import", "importing", "notification_pending", "awaiting_review"):
+        store = Store(tmp_path / f"{status}.db")
+        store.upsert_audit_track(8)
+        job = store.enqueue_job(99, f"{status}-work")
+        if status == "processing":
+            assert store.claim_job()["id"] == job
+        elif status != "queued":
+            store.update_job(job, status)
+
+        assert store.audit_work_pending()
+        assert AuditWorker(store, object(), object(), AuditConfig()).process_once() is None
+
+
 def test_missing_file_and_exception_never_persist_raw_error_or_side_effects(tmp_path):
     class Lidarr:
         def get_track(self, track_id): return {"id": track_id, "trackFileId": 2, "title": "Song", "artist": {"artistName": "Artist"}}
