@@ -108,26 +108,59 @@ def test_lidarr_manual_import_uses_deterministic_official_release_or_fails_witho
         LidarrClient("http://lidarr", "key", session=Session([])).manual_import("/stage/a.m4a", track)
 
 
-def test_lidarr_audit_enumeration_uses_read_only_trackfile_fallback_when_track_paging_is_unavailable():
+def test_lidarr_audit_enumeration_walks_list_only_albums_in_bounded_read_only_slices():
     calls = []
 
     class Session:
         def get(self, url, **kwargs):
-            calls.append((url, kwargs.get("params")))
+            calls.append((url, kwargs.get("params") or {}))
             params = kwargs.get("params") or {}
-            if url.endswith("/trackfile"):
-                assert params == {"page": 1, "pageSize": 2}
-                return Response({"records": [{"id": 10}, {"id": 11}], "totalRecords": 3})
+            if url.endswith("/album"):
+                assert params == {}
+                return Response([{"id": 10}, {"id": 20}, {"id": 30}])
             if url.endswith("/track"):
-                file_id = params["trackFileId"]
-                return Response([{"id": file_id + 100, "trackFileId": file_id}])
-            raise AssertionError(url)
+                album_id = params["albumId"]
+                return Response([
+                    {"id": album_id + 1, "albumId": album_id, "trackFileId": album_id + 100},
+                    {"id": album_id + 2, "albumId": album_id},
+                ])
+            raise AssertionError(f"unexpected endpoint: {url}")
 
     client = LidarrClient("http://lidarr", "key", session=Session())
-    tracks, next_cursor = client.list_audit_tracks("files:1", 2)
-    assert tracks == [{"id": 110, "trackFileId": 10}, {"id": 111, "trackFileId": 11}]
-    assert next_cursor == "files:2"
-    assert all("command" not in url for url, _ in calls)
+    first_tracks, first_cursor = client.list_audit_tracks("albums:0", 2)
+    second_tracks, second_cursor = client.list_audit_tracks(first_cursor, 2)
+
+    assert [track["id"] for track in first_tracks] == [11, 21]
+    assert first_cursor == "albums:2"
+    assert [track["id"] for track in second_tracks] == [31]
+    assert second_cursor is None
+    assert calls == [
+        ("http://lidarr/api/v1/album", {}),
+        ("http://lidarr/api/v1/track", {"albumId": 10}),
+        ("http://lidarr/api/v1/track", {"albumId": 20}),
+        ("http://lidarr/api/v1/album", {}),
+        ("http://lidarr/api/v1/track", {"albumId": 30}),
+    ]
+    assert all("trackfile" not in url and "command" not in url for url, _ in calls)
+
+
+def test_lidarr_audit_enumeration_caps_album_requests_per_cycle():
+    calls = []
+
+    class Session:
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs.get("params") or {}))
+            if url.endswith("/album"):
+                return Response([{"id": album_id} for album_id in range(30)])
+            assert url.endswith("/track")
+            return Response([])
+
+    _, next_cursor = LidarrClient("http://lidarr", "key", session=Session()).list_audit_tracks(
+        "albums:0", 100
+    )
+
+    assert next_cursor == "albums:25"
+    assert len([url for url, _ in calls if url.endswith("/track")]) == 25
 
 
 def test_lidarr_resolve_and_delete_file_api():

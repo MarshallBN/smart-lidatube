@@ -100,67 +100,31 @@ def test_daily_digest_dedupe_pagination_and_sanitization(tmp_path):
     assert bot.send_audit_digest(2, "2000-01-01") is False  # no changes for this date
 
 
-def test_bootstrap_discovers_lidarr_library_in_bounded_batches_without_side_effects(tmp_path):
-    class Lidarr:
-        def __init__(self): self.calls = []
-        def list_audit_tracks(self, cursor, limit):
-            self.calls.append((cursor, limit))
-            return ([{"id": 11, "trackFileId": 101}, {"id": 12}], 2) if cursor == 1 else ([{"id": 13, "trackFileId": 103}], None)
-        def manual_import(self, *args): raise AssertionError("bootstrap must not import")
-    store = Store(tmp_path / "audit.db")
-    lidarr = Lidarr()
-    worker = AuditWorker(store, lidarr, object(), AuditConfig(bootstrap_batch_size=2))
-    assert worker.bootstrap_once() == 1
-    assert store.get_audit_track(11) is not None
-    assert store.get_audit_track(12) is None  # no organized file to audit
-    assert worker.bootstrap_once() == 1
-    assert store.get_audit_track(13) is not None
-    assert lidarr.calls == [(1, 2), (2, 2)]
-
-
-def test_bootstrap_falls_back_to_bounded_trackfile_enumeration_after_empty_primary_page(tmp_path):
+def test_bootstrap_starts_and_resumes_album_cursor_without_trackfile_or_import_fallback(tmp_path):
     class Lidarr:
         def __init__(self):
             self.calls = []
 
         def list_audit_tracks(self, cursor, limit):
             self.calls.append((cursor, limit))
-            if cursor == 1:
-                return ([], None)
-            assert cursor == "files:1"
-            return ([{"id": 22, "trackFileId": 202}], None)
+            if cursor == "albums:0":
+                return ([{"id": 31, "trackFileId": 301}], "albums:2")
+            assert cursor == "albums:2"
+            return ([{"id": 32, "trackFileId": 302}], None)
+
+        def manual_import(self, *args):
+            raise AssertionError("bootstrap must not import")
 
     store = Store(tmp_path / "audit.db")
     lidarr = Lidarr()
     worker = AuditWorker(store, lidarr, object(), AuditConfig(bootstrap_batch_size=2))
-    assert worker.bootstrap_once() == 0
-    assert store.get_setting("audit_bootstrap_cursor") == "files:1"
     assert worker.bootstrap_once() == 1
-    assert store.get_audit_track(22) is not None
-    assert lidarr.calls == [(1, 2), ("files:1", 2)]
-
-
-def test_bootstrap_falls_back_to_bounded_trackfile_enumeration_when_track_paging_is_unsupported(tmp_path):
-    class Lidarr:
-        def __init__(self):
-            self.calls = []
-
-        def list_audit_tracks(self, cursor, limit):
-            self.calls.append((cursor, limit))
-            if cursor == 1:
-                raise RuntimeError("track endpoint rejects pagination")
-            assert cursor == "files:1"
-            return ([{"id": 21, "trackFileId": 201}], None)
-
-    store = Store(tmp_path / "audit.db")
-    lidarr = Lidarr()
-    worker = AuditWorker(store, lidarr, object(), AuditConfig(bootstrap_batch_size=2))
-    assert worker.bootstrap_once() == 0
-    # The fallback cursor is durable; the next bounded read completes bootstrap.
-    assert store.get_setting("audit_bootstrap_cursor") == "files:1"
+    assert store.get_setting("audit_bootstrap_cursor") == "albums:2"
     assert worker.bootstrap_once() == 1
-    assert store.get_audit_track(21) is not None
-    assert lidarr.calls == [(1, 2), ("files:1", 2)]
+    assert store.get_setting("audit_bootstrap_cursor") == "albums:0"
+    assert store.get_audit_track(31) is not None
+    assert store.get_audit_track(32) is not None
+    assert lidarr.calls == [("albums:0", 2), ("albums:2", 2)]
 
 
 def test_remediation_queue_only_accepts_high_confidence_or_explicit_requests_and_is_deduplicated(tmp_path):

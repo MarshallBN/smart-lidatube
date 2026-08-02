@@ -48,30 +48,20 @@ class AuditWorker:
         enumerate_tracks = getattr(self.lidarr, "list_audit_tracks", None)
         if not enumerate_tracks:
             return 0
-        raw_cursor = self.store.get_setting("audit_bootstrap_cursor", "1")
-        cursor = raw_cursor if raw_cursor.startswith("files:") else int(raw_cursor)
+        raw_cursor = self.store.get_setting("audit_bootstrap_cursor", "albums:0")
+        cursor = raw_cursor if raw_cursor.startswith("albums:") else "albums:0"
         try:
             tracks, next_cursor = enumerate_tracks(cursor, self.config.bootstrap_batch_size)
         except Exception:
-            # Some Lidarr builds do not support paginating /track.  Switch to
-            # the client's read-only trackfile-backed strategy on the next
-            # bounded cycle instead of repeatedly failing before any ledger row.
-            if not isinstance(cursor, str):
-                self.store.set_setting("audit_bootstrap_cursor", "files:1")
             return 0
         added = 0
         for track in tracks:
             if track.get("id") is not None and track.get("trackFileId"):
                 self.store.upsert_audit_track(track["id"])
                 added += 1
-        # A successful but unusable first /track page leaves a new ledger
-        # permanently empty on affected Lidarr builds.  Fail closed into the
-        # client's read-only trackfile enumeration only before any rows exist;
-        # later empty pages are ordinary pagination completion, not a fallback.
-        if cursor == 1 and not added and not self.store.audit_status()["total"]:
-            self.store.set_setting("audit_bootstrap_cursor", "files:1")
-        else:
-            self.store.set_setting("audit_bootstrap_cursor", next_cursor if next_cursor is not None else 1)
+        self.store.set_setting(
+            "audit_bootstrap_cursor", next_cursor if next_cursor is not None else "albums:0"
+        )
         return added
 
     def process_once(self):

@@ -37,39 +37,32 @@ class LidarrClient:
     def get_track_file(self, file_id):
         return self._get(f"trackfile/{file_id}")
 
-    def list_audit_tracks(self, cursor=1, limit=100):
-        """Read one bounded organized-track page without making any mutations.
+    def list_audit_tracks(self, cursor="albums:0", limit=100):
+        """Read a bounded organized-track slice through supported Lidarr APIs.
 
-        Older/current Lidarr builds differ on whether ``/track`` supports the
-        page envelope.  The ``files:N`` cursor is a deliberately read-only
-        fallback: enumerate one page of track files and resolve only those
-        file IDs through the supported filtered track endpoint.
+        Lidarr's collection endpoints can return unpaged lists, while ``track``
+        rejects an unfiltered request.  Fetch the album metadata list once per
+        cycle, then use the durable ``albums:N`` offset to request tracks only
+        for that bounded album slice.  This path is deliberately read-only.
         """
-        if str(cursor).startswith("files:"):
-            page = int(str(cursor).split(":", 1)[1])
-            payload = self._get("trackfile", page=page, pageSize=int(limit))
-            files = self._records(payload)
-            tracks = []
-            for track_file in files:
-                file_id = track_file.get("id")
-                if file_id is None:
-                    continue
-                matches = self._records(self._get("track", trackFileId=file_id))
-                matches = [track for track in matches if track.get("trackFileId") == file_id]
-                if len(matches) == 1:
-                    tracks.append(matches[0])
-            if not isinstance(payload, dict):
-                return tracks, None
-            total = int(payload.get("totalRecords", len(files)))
-            return tracks, f"files:{page + 1}" if page * int(limit) < total else None
-        page = int(cursor)
-        payload = self._get("track", page=page, pageSize=int(limit))
-        tracks = self._records(payload)
-        if not isinstance(payload, dict):
-            return tracks, None
-        total = int(payload.get("totalRecords", len(tracks)))
-        next_cursor = page + 1 if page * int(limit) < total else None
-        return tracks, next_cursor
+        if not str(cursor).startswith("albums:"):
+            cursor = "albums:0"
+        offset = int(str(cursor).split(":", 1)[1])
+        albums = self._records(self._get("album"))
+        # One cycle must remain inexpensive even if a legacy config uses a
+        # large track-oriented page size.
+        album_slice = albums[offset:offset + min(max(1, int(limit)), 25)]
+        tracks = []
+        for album in album_slice:
+            album_id = album.get("id")
+            if album_id is None:
+                continue
+            tracks.extend(
+                track for track in self._records(self._get("track", albumId=album_id))
+                if track.get("trackFileId")
+            )
+        next_offset = offset + len(album_slice)
+        return tracks, f"albums:{next_offset}" if next_offset < len(albums) else None
 
     def delete_track_file(self, file_id):
         response = self.session.delete(
