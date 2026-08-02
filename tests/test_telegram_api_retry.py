@@ -43,6 +43,125 @@ def test_audit_review_api_actions_are_authenticated_and_reversible(tmp_path):
     assert store.get_audit_track(7)["do_not_upgrade"] == 0
 
 
+def _awaiting_audit_attempt(store, track_id=1, provider="youtube", source_id="candidate"):
+    job = store.enqueue_job(
+        track_id, f"audit-{track_id}-{source_id}", mode="manual",
+        metadata={"audit_remediation": "recording_mismatch"},
+    )
+    attempt = store.add_attempt(job, provider, source_id)
+    store.update_attempt(attempt, verdict="awaiting_review")
+    store.update_job(job, "awaiting_review")
+    return job, attempt
+
+
+def test_audit_attempt_review_api_requires_token_and_accepts_audit_attempt(tmp_path):
+    store = Store(tmp_path / "x.db")
+    job, attempt = _awaiting_audit_attempt(store)
+    client = create_api(store, "secret").test_client()
+
+    assert client.post(
+        f"/api/smart/audit/attempts/{attempt}/review", json={"action": "accept"}
+    ).status_code == 401
+    response = client.post(
+        f"/api/smart/audit/attempts/{attempt}/review",
+        json={"action": "accept"},
+        headers={"Authorization": "Bearer secret"},
+    )
+
+    assert response.status_code == 202
+    assert response.get_json() == {"attempt_id": attempt, "status": "ready_import"}
+    assert store.get_job(job)["status"] == "ready_import"
+    assert store.get_attempt(attempt)["verdict"] == "manual_accepted"
+
+
+def test_audit_attempt_review_api_rejects_a_candidate_only_for_that_track(tmp_path):
+    store = Store(tmp_path / "x.db")
+    job, attempt = _awaiting_audit_attempt(store, track_id=7, source_id="bad")
+    client = create_api(store, "secret").test_client()
+
+    response = client.post(
+        f"/api/smart/audit/attempts/{attempt}/review",
+        json={"action": "reject"},
+        headers={"Authorization": "Bearer secret"},
+    )
+
+    assert response.status_code == 202
+    assert response.get_json() == {"attempt_id": attempt, "status": "queued"}
+    assert store.get_job(job)["status"] == "queued"
+    assert store.is_rejected(7, "youtube", "bad")
+    assert not store.is_rejected(8, "youtube", "bad")
+
+
+def test_audit_attempt_review_api_ignores_track(tmp_path):
+    store = Store(tmp_path / "x.db")
+    job, attempt = _awaiting_audit_attempt(store, track_id=9)
+    client = create_api(store, "secret").test_client()
+
+    response = client.post(
+        f"/api/smart/audit/attempts/{attempt}/review",
+        json={"action": "ignore_track"},
+        headers={"Authorization": "Bearer secret"},
+    )
+
+    assert response.status_code == 202
+    assert response.get_json() == {"attempt_id": attempt, "status": "cancelled"}
+    assert store.get_job(job)["status"] == "cancelled"
+    assert store.get_audit_track(9)["do_not_upgrade"] == 1
+
+
+def test_audit_attempt_review_api_defers_and_requeues(tmp_path):
+    store = Store(tmp_path / "x.db")
+    job, attempt = _awaiting_audit_attempt(store, track_id=10)
+    client = create_api(store, "secret").test_client()
+
+    response = client.post(
+        f"/api/smart/audit/attempts/{attempt}/review",
+        json={"action": "audit_later"},
+        headers={"Authorization": "Bearer secret"},
+    )
+
+    assert response.status_code == 202
+    assert response.get_json() == {"attempt_id": attempt, "status": "queued"}
+    assert store.get_job(job)["status"] == "queued"
+    assert store.get_attempt(attempt)["verdict"] == "deferred"
+
+
+def test_audit_attempt_review_api_rejects_unknown_non_audit_and_stale_actions(tmp_path):
+    store = Store(tmp_path / "x.db")
+    client = create_api(store, "secret").test_client()
+    headers = {"Authorization": "Bearer secret"}
+
+    unknown = client.post(
+        "/api/smart/audit/attempts/999/review", json={"action": "accept"}, headers=headers
+    )
+    assert unknown.status_code == 409
+    assert unknown.get_json() == {"error": "audit review is unavailable"}
+
+    job = store.enqueue_job(11, "ordinary")
+    ordinary = store.add_attempt(job, "youtube", "candidate")
+    store.update_attempt(ordinary, verdict="awaiting_review")
+    store.update_job(job, "awaiting_review")
+    non_audit = client.post(
+        f"/api/smart/audit/attempts/{ordinary}/review",
+        json={"action": "accept"}, headers=headers,
+    )
+    assert non_audit.status_code == 409
+    assert non_audit.get_json() == {"error": "audit review is unavailable"}
+
+    _, audit_attempt = _awaiting_audit_attempt(store, track_id=12)
+    accepted = client.post(
+        f"/api/smart/audit/attempts/{audit_attempt}/review",
+        json={"action": "accept"}, headers=headers,
+    )
+    stale = client.post(
+        f"/api/smart/audit/attempts/{audit_attempt}/review",
+        json={"action": "reject"}, headers=headers,
+    )
+    assert accepted.status_code == 202
+    assert stale.status_code == 409
+    assert stale.get_json() == {"error": "audit review is unavailable"}
+
+
 def test_token_authenticated_retry_api(tmp_path):
     s=Store(tmp_path/"x.db"); app=create_api(s,"secret"); client=app.test_client()
     assert client.post("/api/smart/retry/22").status_code == 401

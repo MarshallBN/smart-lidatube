@@ -57,6 +57,22 @@ def register_api(app, store, token):
     def audit_status():
         return jsonify(audit=store.audit_status())
 
+    @app.post("/api/smart/audit/attempts/<int:attempt_id>/review")
+    @auth
+    def review_audit_attempt(attempt_id):
+        action = (request.get_json(silent=True) or {}).get("action")
+        statuses = {
+            "accept": "ready_import",
+            "reject": "queued",
+            "ignore_track": "cancelled",
+            "audit_later": "queued",
+        }
+        if action not in statuses:
+            return jsonify(error="invalid audit review action"), 400
+        if store.apply_audit_review(attempt_id, action, {"api_review": True}) is None:
+            return jsonify(error="audit review is unavailable"), 409
+        return jsonify(attempt_id=attempt_id, status=statuses[action]), 202
+
     @app.post("/api/smart/audit/<int:track_id>/ignore")
     @auth
     def ignore_audit_track(track_id):
