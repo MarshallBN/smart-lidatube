@@ -205,7 +205,7 @@ class JobWorker:
                 decision = quality_decision(
                     current_quality,
                     verification.evidence or {},
-                    edition_match=(verification.evidence or {}).get("edition_match") is True,
+                    edition_match=(verification.evidence or {}).get("edition_match"),
                     identity_verified=verification.verdict == "accepted",
                 )
                 if decision == "rejected":

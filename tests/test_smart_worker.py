@@ -189,7 +189,7 @@ def test_audit_origin_rejects_verified_lossless_current_file_before_review(tmp_p
     assert store.list_attempts(job)[0]["verdict"] == "rejected"
 
 
-def test_audit_origin_rejects_uncertain_edition_and_never_auto_import(tmp_path):
+def test_audit_origin_rejects_known_edition_mismatch_and_never_auto_import(tmp_path):
     store = Store(tmp_path / "smart.db")
     job = store.enqueue_job(1, "audit-edition", metadata={"audit_remediation": "recording_mismatch"})
 
@@ -208,6 +208,29 @@ def test_audit_origin_rejects_uncertain_edition_and_never_auto_import(tmp_path):
     worker = JobWorker(store, Lidarr(), Sources(), Verifier(), tmp_path)
     assert worker.process_once() == job
     assert store.list_attempts(job)[0]["verdict"] == "rejected"
+
+
+def test_audit_origin_sends_verified_recording_match_without_edition_evidence_to_review(tmp_path):
+    store = Store(tmp_path / "smart.db")
+    job = store.enqueue_job(1, "audit-recording-match", metadata={"audit_remediation": "recording_mismatch"})
+    sent = []
+
+    class Lidarr:
+        def get_track(self, track_id): return {"id": track_id, "trackFileId": 4, "title": "Song", "artist": {"artistName": "Artist"}}
+        def get_track_file(self, file_id): return {"id": file_id, "mediaInfo": {"audioFormat": "MP3"}}
+        def track_identity(self, track): return {"recording_id": "expected", "artist": "Artist", "title": "Song", "track_file_id": 4}
+        def manual_import(self, *args): raise AssertionError("audit work must never auto import")
+    class Sources:
+        def search(self, *args): return [{"provider": "youtube", "source_id": "x"}]
+        def download(self, candidate, directory):
+            directory.mkdir(parents=True, exist_ok=True); path = directory / "x"; path.write_bytes(b"audio"); return path
+    class Verifier:
+        def verify_file(self, path, identity): return type("V", (), {"verdict": "accepted", "reason": "recording_match", "evidence": {"actual_duration": 200}})()
+
+    worker = JobWorker(store, Lidarr(), Sources(), Verifier(), tmp_path, telegram=type("T", (), {"send_review": lambda *args: sent.append(args) or True})(), review_chat_id=9)
+    assert worker.process_once() == job
+    assert len(sent) == 1
+    assert store.list_attempts(job)[0]["verdict"] == "awaiting_review"
 
 
 def test_audit_review_actions_are_distinct_one_shot_and_safe(tmp_path):
