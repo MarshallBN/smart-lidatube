@@ -177,6 +177,14 @@ def test_high_confidence_audit_result_enqueues_remediation_but_exemption_defers_
     assert store.claim_remediation() is None
 
 
+def test_quality_policy_never_claims_youtube_is_upgrade_from_extension_or_bitrate_alone():
+    from smart_lidatube.quality import quality_decision
+
+    assert quality_decision({"codec": "flac", "verified": True}, {"codec": "m4a", "bitrate": 999}) == "rejected"
+    assert quality_decision({"codec": "mp3", "bitrate": 128}, {"codec": "m4a", "bitrate": 320}) == "review_only"
+    assert quality_decision({"codec": "mp3", "verified": True}, {"codec": "m4a"}, edition_match=False) == "rejected"
+
+
 def test_token_is_not_consumed_until_a_candidate_exists(tmp_path):
     store = Store(tmp_path / "audit.db")
     clock = lambda: datetime(2026, 1, 1)
