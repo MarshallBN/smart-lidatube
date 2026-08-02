@@ -141,6 +141,42 @@ def test_bootstrap_falls_back_to_bounded_trackfile_enumeration_when_track_paging
     assert lidarr.calls == [(1, 2), ("files:1", 2)]
 
 
+def test_remediation_queue_only_accepts_high_confidence_or_explicit_requests_and_is_deduplicated(tmp_path):
+    store = Store(tmp_path / "audit.db")
+    assert store.enqueue_remediation(1, "verified") is None
+    first = store.enqueue_remediation(2, "missing_or_corrupt")
+    assert first is not None
+    assert store.enqueue_remediation(2, "missing_or_corrupt") == first
+    assert store.enqueue_remediation(3, "explicit_request") is not None
+    assert store.claim_remediation() == {"lidarr_track_id": 2, "reason": "missing_or_corrupt"}
+
+
+def test_budgeted_remediation_dispatch_creates_manual_job_and_yields_to_normal_work(tmp_path):
+    from smart_lidatube.remediation import RemediationDispatcher
+
+    store = Store(tmp_path / "audit.db")
+    store.enqueue_remediation(4, "recording_mismatch")
+    dispatcher = RemediationDispatcher(store, budget_per_hour=1, max_token_bank=1)
+    assert dispatcher.dispatch_once() is not None
+    jobs = store.list_jobs_for_track(4)
+    assert len(jobs) == 1 and jobs[0]["mode"] == "manual"
+    assert jobs[0]["metadata"] == {"audit_remediation": "recording_mismatch"}
+
+    store.enqueue_remediation(5, "missing_or_corrupt")
+    store.enqueue_job(99, "normal-user-work")
+    assert dispatcher.dispatch_once() is None
+
+
+def test_high_confidence_audit_result_enqueues_remediation_but_exemption_defers_it(tmp_path):
+    store = Store(tmp_path / "audit.db")
+    store.record_audit_result(7, "suspect", {"reason": "recording_mismatch"})
+    assert store.claim_remediation() == {"lidarr_track_id": 7, "reason": "recording_mismatch"}
+
+    store.set_audit_exemption(8, do_not_upgrade=True)
+    store.record_audit_result(8, "unavailable", {"reason": "target_file_missing"})
+    assert store.claim_remediation() is None
+
+
 def test_token_is_not_consumed_until_a_candidate_exists(tmp_path):
     store = Store(tmp_path / "audit.db")
     clock = lambda: datetime(2026, 1, 1)

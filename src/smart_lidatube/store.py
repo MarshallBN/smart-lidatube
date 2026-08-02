@@ -28,6 +28,8 @@ class Store:
             CREATE INDEX IF NOT EXISTS library_audit_eligible ON library_audit_tracks(do_not_audit,next_check_at,priority_score,last_checked_at);
             CREATE TABLE IF NOT EXISTS library_audit_events(id INTEGER PRIMARY KEY,lidarr_track_id INTEGER NOT NULL REFERENCES library_audit_tracks(lidarr_track_id),event_type TEXT NOT NULL,result_status TEXT NOT NULL,evidence_json TEXT NOT NULL DEFAULT '{}',audit_local_day TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
             CREATE INDEX IF NOT EXISTS library_audit_events_report ON library_audit_events(audit_local_day,result_status,lidarr_track_id);
+            CREATE TABLE IF NOT EXISTS remediation_queue(id INTEGER PRIMARY KEY,lidarr_track_id INTEGER NOT NULL UNIQUE,reason TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'eligible',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+            CREATE INDEX IF NOT EXISTS remediation_queue_eligible ON remediation_queue(status,id);
             """)
             self._add_columns(c, "retry_jobs", {
                 "updated_at": "TEXT", "last_error": "TEXT", "claimed_at": "TEXT",
@@ -189,6 +191,11 @@ class Store:
                 )
             return bool(changed)
 
+    def list_jobs_for_track(self, track_id):
+        with self._connect() as c:
+            rows = c.execute("SELECT * FROM retry_jobs WHERE lidarr_track_id=? ORDER BY id", (track_id,)).fetchall()
+        return [self._decode(row, ("metadata", "import_result")) for row in rows]
+
     def get_job(self,job_id):
         with self._connect() as c:r=c.execute("SELECT * FROM retry_jobs WHERE id=?",(job_id,)).fetchone()
         return self._decode(r,("metadata","import_result")) if r else None
@@ -277,6 +284,33 @@ class Store:
             c.execute("UPDATE library_audit_tracks SET status=?,last_checked_at=CURRENT_TIMESTAMP,next_check_at=?,check_count=check_count+1,last_file_marker=COALESCE(?,last_file_marker),evidence_json=?,last_error_code=?,updated_at=CURRENT_TIMESTAMP WHERE lidarr_track_id=?",(status,next_check_at,marker,json.dumps(safe),error_code,track_id))
             if previous != status:
                 c.execute("INSERT INTO library_audit_events(lidarr_track_id,event_type,result_status,evidence_json,audit_local_day) VALUES(?,?,?,?,?)",(track_id,"classification_change",status,json.dumps(safe),audit_local_day))
+            reason_map = {
+                ("suspect", "recording_mismatch"): "recording_mismatch",
+                ("unavailable", "target_file_missing"): "missing_or_corrupt",
+            }
+            reason = reason_map.get((status, safe.get("reason")))
+            exempt = c.execute("SELECT do_not_upgrade FROM library_audit_tracks WHERE lidarr_track_id=?", (track_id,)).fetchone()["do_not_upgrade"]
+            if reason and not exempt:
+                c.execute("INSERT OR IGNORE INTO remediation_queue(lidarr_track_id,reason) VALUES(?,?)", (track_id, reason))
+    def enqueue_remediation(self, track_id, reason):
+        """Queue only an explicitly requested or high-confidence audit repair."""
+        allowed = {"missing_or_corrupt", "recording_mismatch", "explicit_request", "approved_upgrade"}
+        if reason not in allowed:
+            return None
+        with self._connect() as c:
+            c.execute("INSERT OR IGNORE INTO remediation_queue(lidarr_track_id,reason) VALUES(?,?)", (track_id, reason))
+            row = c.execute("SELECT id FROM remediation_queue WHERE lidarr_track_id=?", (track_id,)).fetchone()
+        return row["id"]
+
+    def claim_remediation(self):
+        with self._connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute("SELECT * FROM remediation_queue WHERE status='eligible' ORDER BY id LIMIT 1").fetchone()
+            if not row:
+                return None
+            changed = c.execute("UPDATE remediation_queue SET status='searching',updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='eligible'", (row["id"],)).rowcount
+            return {"lidarr_track_id": row["lidarr_track_id"], "reason": row["reason"]} if changed else None
+
     def audit_status(self):
         with self._connect() as c:
             total=c.execute("SELECT COUNT(*) FROM library_audit_tracks").fetchone()[0]; checked=c.execute("SELECT COUNT(*) FROM library_audit_tracks WHERE check_count>0").fetchone()[0]; eligible=c.execute("SELECT COUNT(*) FROM library_audit_tracks WHERE do_not_audit=0 AND (next_check_at IS NULL OR next_check_at<=CURRENT_TIMESTAMP)").fetchone()[0]; counts=dict(c.execute("SELECT status,COUNT(*) FROM library_audit_tracks GROUP BY status").fetchall())
