@@ -53,16 +53,28 @@ class LidarrClient:
         # large track-oriented page size.
         album_slice = albums[offset:offset + min(max(1, int(limit)), 25)]
         tracks = []
+        failed_track_queries = 0
         for album in album_slice:
             album_id = album.get("id")
             if album_id is None:
                 continue
-            tracks.extend(
-                track for track in self._records(self._get("track", albumId=album_id))
-                if track.get("trackFileId")
-            )
+            try:
+                tracks.extend(
+                    track for track in self._records(self._get("track", albumId=album_id))
+                    if track.get("trackFileId")
+                )
+            except Exception:
+                # A single unsupported/bad album must not strand the durable
+                # cursor.  Deliberately retain no exception details: request
+                # URLs may carry identifiers or credentials.
+                failed_track_queries += 1
         next_offset = offset + len(album_slice)
-        return tracks, f"albums:{next_offset}" if next_offset < len(albums) else None
+        bootstrap = {
+            "status": "partial" if failed_track_queries else "ok",
+            "error": "track_query_failed" if failed_track_queries else None,
+            "count": failed_track_queries,
+        }
+        return tracks, f"albums:{next_offset}" if next_offset < len(albums) else None, bootstrap
 
     def delete_track_file(self, file_id):
         response = self.session.delete(

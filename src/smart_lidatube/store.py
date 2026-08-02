@@ -297,6 +297,22 @@ class Store:
     def get_setting(self,key,default=None):
         with self._connect() as c:r=c.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()
         return r[0] if r else default
+    def set_audit_bootstrap_state(self, status, error, count, cursor):
+        """Persist only bounded, public-safe bootstrap diagnostics."""
+        status = status if status in {"ok", "partial", "failed"} else "failed"
+        error = error if error in {None, "track_query_failed", "album_list_failed"} else "album_list_failed"
+        try:
+            count = max(0, int(count))
+        except (TypeError, ValueError):
+            count = 0
+        cursor = cursor if isinstance(cursor, str) and cursor.startswith("albums:") else "albums:0"
+        for key, value in (
+            ("audit_bootstrap_cursor", cursor),
+            ("audit_bootstrap_status", status),
+            ("audit_bootstrap_last_error", error or ""),
+            ("audit_bootstrap_error_count", count),
+        ):
+            self.set_setting(key, value)
     # Audit records are isolated from retry jobs; audit writes can never enqueue imports.
     @staticmethod
     def _safe_audit_evidence(evidence):
@@ -391,7 +407,20 @@ class Store:
     def audit_status(self):
         with self._connect() as c:
             total=c.execute("SELECT COUNT(*) FROM library_audit_tracks").fetchone()[0]; checked=c.execute("SELECT COUNT(*) FROM library_audit_tracks WHERE check_count>0").fetchone()[0]; eligible=c.execute("SELECT COUNT(*) FROM library_audit_tracks WHERE do_not_audit=0 AND (next_check_at IS NULL OR next_check_at<=CURRENT_TIMESTAMP)").fetchone()[0]; counts=dict(c.execute("SELECT status,COUNT(*) FROM library_audit_tracks GROUP BY status").fetchall())
-        return {"checked_total":checked,"eligible_total":eligible,"total":total,"enabled":self.get_setting("audit_enabled","true")=="true","budget_per_hour":int(self.get_setting("audit_budget_per_hour","12")),"tokens_available":int(float((self.get_setting("audit_tokens", "0:0")).split(":")[0])),**counts}
+        bootstrap_status = self.get_setting("audit_bootstrap_status", "idle")
+        bootstrap_error = self.get_setting("audit_bootstrap_last_error") or None
+        try:
+            bootstrap_count = max(0, int(self.get_setting("audit_bootstrap_error_count", "0")))
+        except ValueError:
+            bootstrap_count = 0
+        cursor = self.get_setting("audit_bootstrap_cursor", "albums:0")
+        bootstrap = {
+            "status": bootstrap_status if bootstrap_status in {"idle", "ok", "partial", "failed"} else "failed",
+            "last_error": bootstrap_error if bootstrap_error in {None, "track_query_failed", "album_list_failed"} else "album_list_failed",
+            "error_count": bootstrap_count,
+            "cursor": cursor if cursor.startswith("albums:") else "albums:0",
+        }
+        return {"checked_total":checked,"eligible_total":eligible,"total":total,"enabled":self.get_setting("audit_enabled","true")=="true","budget_per_hour":int(self.get_setting("audit_budget_per_hour","12")),"tokens_available":int(float((self.get_setting("audit_tokens", "0:0")).split(":")[0])),"bootstrap":bootstrap,**counts}
     def audit_digest_events(self,date):
         with self._connect() as c:rows=c.execute("SELECT lidarr_track_id,result_status,evidence_json FROM library_audit_events WHERE audit_local_day=? AND event_type='classification_change' ORDER BY id",(date,)).fetchall()
         return [self._decode(row,("evidence_json",)) for row in rows]

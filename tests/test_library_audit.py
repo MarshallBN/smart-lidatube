@@ -127,6 +127,70 @@ def test_bootstrap_starts_and_resumes_album_cursor_without_trackfile_or_import_f
     assert lidarr.calls == [("albums:0", 2), ("albums:2", 2)]
 
 
+def test_bootstrap_persists_sanitized_partial_state_and_never_mutates_library(tmp_path):
+    secret = "https://lidarr.example/track?albumId=secret-album&apiKey=top-secret"
+
+    class Lidarr:
+        def list_audit_tracks(self, cursor, limit):
+            assert (cursor, limit) == ("albums:0", 2)
+            return ([{"id": 42, "trackFileId": 420}], "albums:2", {
+                "status": "partial", "error": "track_query_failed", "count": 1,
+            })
+
+        def manual_import(self, *args):
+            raise AssertionError("bootstrap must not import")
+
+        def delete_track_file(self, *args):
+            raise AssertionError("bootstrap must not delete")
+
+    store = Store(tmp_path / "audit.db")
+    worker = AuditWorker(store, Lidarr(), object(), AuditConfig(bootstrap_batch_size=2))
+
+    assert worker.bootstrap_once() == 1
+    assert store.get_audit_track(42) is not None
+    assert store.get_setting("audit_bootstrap_cursor") == "albums:2"
+    assert store.get_setting("audit_bootstrap_last_error") == "track_query_failed"
+    assert store.get_setting("audit_bootstrap_error_count") == "1"
+    assert secret not in str(store.audit_status())
+    assert store.audit_status()["bootstrap"] == {
+        "status": "partial", "last_error": "track_query_failed", "error_count": 1, "cursor": "albums:2",
+    }
+    assert store.list_jobs_for_track(42) == []
+
+
+def test_audit_status_api_exposes_only_sanitized_bootstrap_state(tmp_path):
+    from smart_lidatube.api import create_api
+
+    store = Store(tmp_path / "audit.db")
+    store.set_audit_bootstrap_state("partial", "track_query_failed", 1, "albums:2")
+    payload = create_api(store, "test-token").test_client().get(
+        "/api/smart/audit/status", headers={"Authorization": "Bearer test-token"}
+    ).get_json()["audit"]
+
+    assert payload["bootstrap"] == {
+        "status": "partial", "last_error": "track_query_failed", "error_count": 1, "cursor": "albums:2",
+    }
+    assert "test-token" not in str(payload)
+
+
+def test_bootstrap_marks_initial_album_list_failure_without_raw_exception(tmp_path):
+    secret = "https://lidarr.example/album?apiKey=top-secret"
+
+    class Lidarr:
+        def list_audit_tracks(self, cursor, limit):
+            raise RuntimeError(secret)
+
+    store = Store(tmp_path / "audit.db")
+    worker = AuditWorker(store, Lidarr(), object(), AuditConfig())
+
+    assert worker.bootstrap_once() == 0
+    assert store.get_setting("audit_bootstrap_cursor") == "albums:0"
+    assert store.audit_status()["bootstrap"] == {
+        "status": "failed", "last_error": "album_list_failed", "error_count": 1, "cursor": "albums:0",
+    }
+    assert secret not in str(store.audit_status())
+
+
 def test_remediation_queue_only_accepts_high_confidence_or_explicit_requests_and_is_deduplicated(tmp_path):
     store = Store(tmp_path / "audit.db")
     assert store.enqueue_remediation(1, "verified") is None

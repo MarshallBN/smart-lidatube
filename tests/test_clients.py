@@ -127,13 +127,15 @@ def test_lidarr_audit_enumeration_walks_list_only_albums_in_bounded_read_only_sl
             raise AssertionError(f"unexpected endpoint: {url}")
 
     client = LidarrClient("http://lidarr", "key", session=Session())
-    first_tracks, first_cursor = client.list_audit_tracks("albums:0", 2)
-    second_tracks, second_cursor = client.list_audit_tracks(first_cursor, 2)
+    first_tracks, first_cursor, first_bootstrap = client.list_audit_tracks("albums:0", 2)
+    second_tracks, second_cursor, second_bootstrap = client.list_audit_tracks(first_cursor, 2)
 
     assert [track["id"] for track in first_tracks] == [11, 21]
     assert first_cursor == "albums:2"
+    assert first_bootstrap == {"status": "ok", "error": None, "count": 0}
     assert [track["id"] for track in second_tracks] == [31]
     assert second_cursor is None
+    assert second_bootstrap == {"status": "ok", "error": None, "count": 0}
     assert calls == [
         ("http://lidarr/api/v1/album", {}),
         ("http://lidarr/api/v1/track", {"albumId": 10}),
@@ -142,6 +144,28 @@ def test_lidarr_audit_enumeration_walks_list_only_albums_in_bounded_read_only_sl
         ("http://lidarr/api/v1/track", {"albumId": 30}),
     ]
     assert all("trackfile" not in url and "command" not in url for url, _ in calls)
+
+
+def test_lidarr_audit_enumeration_skips_failed_album_queries_and_reports_only_generic_error():
+    secret = "https://lidarr.example/track?albumId=secret-album&apiKey=top-secret"
+
+    class Session:
+        def get(self, url, **kwargs):
+            params = kwargs.get("params") or {}
+            if url.endswith("/album"):
+                return Response([{"id": 10}, {"id": 20}])
+            if params["albumId"] == 10:
+                raise RuntimeError(secret)
+            return Response([{"id": 21, "trackFileId": 201}])
+
+    tracks, next_cursor, bootstrap = LidarrClient("http://lidarr", "key", session=Session()).list_audit_tracks(
+        "albums:0", 2
+    )
+
+    assert tracks == [{"id": 21, "trackFileId": 201}]
+    assert next_cursor is None
+    assert bootstrap == {"status": "partial", "error": "track_query_failed", "count": 1}
+    assert secret not in str(bootstrap)
 
 
 def test_lidarr_audit_enumeration_caps_album_requests_per_cycle():
@@ -155,11 +179,12 @@ def test_lidarr_audit_enumeration_caps_album_requests_per_cycle():
             assert url.endswith("/track")
             return Response([])
 
-    _, next_cursor = LidarrClient("http://lidarr", "key", session=Session()).list_audit_tracks(
+    _, next_cursor, bootstrap = LidarrClient("http://lidarr", "key", session=Session()).list_audit_tracks(
         "albums:0", 100
     )
 
     assert next_cursor == "albums:25"
+    assert bootstrap == {"status": "ok", "error": None, "count": 0}
     assert len([url for url, _ in calls if url.endswith("/track")]) == 25
 
 

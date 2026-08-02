@@ -51,16 +51,23 @@ class AuditWorker:
         raw_cursor = self.store.get_setting("audit_bootstrap_cursor", "albums:0")
         cursor = raw_cursor if raw_cursor.startswith("albums:") else "albums:0"
         try:
-            tracks, next_cursor = enumerate_tracks(cursor, self.config.bootstrap_batch_size)
+            result = enumerate_tracks(cursor, self.config.bootstrap_batch_size)
         except Exception:
+            # The album list itself was unavailable.  Keep its cursor for a
+            # retry, but leave a bounded, safe diagnostic rather than silently
+            # spinning forever before any durable bootstrap state exists.
+            self.store.set_audit_bootstrap_state("failed", "album_list_failed", 1, cursor)
             return 0
+        tracks, next_cursor = result[:2]
+        bootstrap = result[2] if len(result) > 2 else {"status": "ok", "error": None, "count": 0}
         added = 0
         for track in tracks:
             if track.get("id") is not None and track.get("trackFileId"):
                 self.store.upsert_audit_track(track["id"])
                 added += 1
-        self.store.set_setting(
-            "audit_bootstrap_cursor", next_cursor if next_cursor is not None else "albums:0"
+        next_cursor = next_cursor if next_cursor is not None else "albums:0"
+        self.store.set_audit_bootstrap_state(
+            bootstrap.get("status"), bootstrap.get("error"), bootstrap.get("count"), next_cursor
         )
         return added
 
