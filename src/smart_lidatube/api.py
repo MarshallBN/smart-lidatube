@@ -3,7 +3,7 @@
 from functools import wraps
 from uuid import uuid4
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
 
 VALID_MODES = {"auto", "manual"}
@@ -51,8 +51,83 @@ def register_api(app, store, token):
     def job(job_id):
         value = store.get_job(job_id)
         if value:
-            return jsonify(value), 200
+            return jsonify(store.safe_job(job_id)), 200
         return jsonify(error="not found"), 404
+
+    def pagination():
+        try:
+            cursor, limit = int(request.args.get("cursor", 0)), int(request.args.get("limit", 50))
+        except (TypeError, ValueError):
+            return None
+        return (cursor, limit) if cursor >= 0 and 1 <= limit <= 200 else None
+
+    @app.get("/api/smart/dashboard/summary")
+    @auth
+    def dashboard_summary():
+        return jsonify(store.dashboard_summary())
+
+    @app.get("/api/smart/quality")
+    @app.get("/api/smart/dashboard/quality")
+    @auth
+    def quality_summary():
+        return jsonify(store.quality_summary())
+
+    @app.get("/api/smart/events")
+    @app.get("/api/smart/dashboard/events")
+    @auth
+    def events():
+        values = pagination()
+        if not values:
+            return jsonify(error="cursor must be non-negative and limit must be 1-200"), 400
+        cursor, limit = values; items = store.list_events(cursor, limit)
+        return jsonify(items=items, next_cursor=items[-1]["id"] if items else cursor)
+
+    @app.get("/api/smart/jobs")
+    @auth
+    def jobs():
+        values = pagination()
+        if not values:
+            return jsonify(error="cursor must be non-negative and limit must be 1-200"), 400
+        cursor, limit = values; items = store.list_safe_jobs(cursor, limit)
+        next_cursor = int(items[-1]["id"].split(":")[1]) if items else cursor
+        return jsonify(items=items, next_cursor=next_cursor)
+
+    @app.get("/api/smart/reviews")
+    @auth
+    def reviews():
+        values = pagination()
+        if not values:
+            return jsonify(error="cursor must be non-negative and limit must be 1-200"), 400
+        cursor, limit = values; items = store.list_safe_reviews(cursor, limit)
+        return jsonify(items=items, next_cursor=items[-1]["attempt_id"] if items else cursor)
+
+    @app.post("/api/smart/reviews/<int:attempt_id>/action")
+    @auth
+    def candidate_action(attempt_id):
+        action = (request.get_json(silent=True) or {}).get("action")
+        if action not in {"accept", "reject", "cancel", "ignore_track", "audit_later"}:
+            return jsonify(error="invalid review action"), 400
+        reviews = store.list_safe_reviews(max(0, attempt_id-1), 1)
+        audit_origin = reviews and reviews[0]["attempt_id"] == attempt_id and reviews[0]["audit_origin"]
+        if audit_origin:
+            result = store.apply_audit_review(attempt_id, action, {"api_review": True})
+        elif action in {"accept", "reject", "cancel"}:
+            result = store.apply_review(attempt_id, action, {"api_review": True})
+        else:
+            result = None
+        if result is None:
+            return jsonify(error="review is unavailable"), 409
+        return jsonify(attempt_id=attempt_id, job_id=f"job:{result}"), 202
+
+    @app.post("/api/smart/audit/control")
+    @auth
+    def audit_control():
+        mode = (request.get_json(silent=True) or {}).get("mode")
+        if mode not in {"observe", "review", "paused"}:
+            return jsonify(error="mode must be observe, review, or paused"), 400
+        store.set_setting("audit_mode", mode)
+        store.record_event("api", "info", "mode_changed", "audit_mode", {"mode": mode})
+        return jsonify(mode=mode), 202
 
     @app.get("/api/smart/audit/status")
     @auth
@@ -105,6 +180,18 @@ def register_api(app, store, token):
     def audit_later(track_id):
         store.set_audit_exemption(track_id, do_not_upgrade=False)
         return jsonify(track_id=track_id, do_not_upgrade=False), 202
+
+    @app.get("/smart-control")
+    def control_page():
+        return Response("""<!doctype html><meta charset=utf-8><title>Smart LidaTube Control</title>
+<style>body{font:16px system-ui;max-width:1100px;margin:auto;background:#111;color:#eee}section{border:1px solid #444;margin:1rem;padding:1rem}pre{white-space:pre-wrap}</style>
+<h1>Smart LidaTube Control</h1><button onclick='connect()'>Connect</button>
+<section><h2>Dashboard</h2><pre id=dashboard></pre></section><section><h2>Quality</h2><pre id=quality></pre></section>
+<section><h2>Reviews</h2><pre id=reviews></pre></section><section><h2>Jobs</h2><pre id=jobs></pre></section>
+<section><h2>Events</h2><pre id=events></pre></section><script>
+let token = ''; async function load(name,path){let r=await fetch(path,{headers:{Authorization:'Bearer '+token}});document.getElementById(name).textContent=JSON.stringify(await r.json(),null,2)}
+function connect(){token=prompt('API token')||'';load('dashboard','/api/smart/dashboard/summary');load('quality','/api/smart/quality');load('reviews','/api/smart/reviews');load('jobs','/api/smart/jobs');load('events','/api/smart/events')}
+</script>""", mimetype="text/html")
 
     @app.get("/health")
     def health():

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from smart_lidatube.healthcheck import worker_is_healthy
 from smart_lidatube.runner import build_components
+from smart_lidatube.quality import FFprobe
 from smart_lidatube.store import Store
 from smart_lidatube.worker import JobWorker
 
@@ -201,3 +202,26 @@ def test_build_components_retains_three_item_public_return(monkeypatch, tmp_path
     assert len(components) == 3
     assert hasattr(components[0], "audit_worker")
     assert hasattr(components[0], "remediation_dispatcher")
+
+
+def test_runner_wires_quality_probe_and_safe_control_flags(monkeypatch, tmp_path):
+    monkeypatch.setenv("SMART_DB_PATH", str(tmp_path / "db"))
+    monkeypatch.setenv("SMART_VERSION", "milestone-a")
+    monkeypatch.setenv("SMART_AUDIT_MODE", "review")
+    monkeypatch.setenv("SMART_FFPROBE_TIMEOUT", "4")
+    monkeypatch.setenv("SMART_AUDIT_CANDIDATE_SEARCH_BUDGET_PER_HOUR", "0")
+    worker, _, _ = build_components()
+    assert isinstance(worker.audit_worker.probe, FFprobe)
+    assert worker.audit_worker.probe.timeout == 4
+    assert worker.store.get_setting("app_version") == "milestone-a"
+    assert worker.store.get_setting("audit_mode") == "review"
+    assert worker.store.get_setting("candidate_discovery_budget_per_hour") == "0"
+
+
+def test_runner_preserves_api_persisted_mode_and_rejects_unsafe_env_default(monkeypatch, tmp_path):
+    path = tmp_path / "db"
+    Store(path).set_setting("audit_mode", "paused")
+    monkeypatch.setenv("SMART_DB_PATH", str(path))
+    monkeypatch.setenv("SMART_AUDIT_MODE", "auto_safe")
+    worker, _, _ = build_components()
+    assert worker.store.get_setting("audit_mode") == "paused"

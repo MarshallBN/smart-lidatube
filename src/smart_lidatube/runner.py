@@ -11,6 +11,7 @@ from smart_lidatube.clients import LidarrClient, NavidromeClient, YouTubeClient
 from smart_lidatube.fingerprint import AcoustIDClient, FileVerifier, Fpcalc
 from smart_lidatube.retry import PlaylistPoller
 from smart_lidatube.remediation import RemediationDispatcher
+from smart_lidatube.quality import FFprobe
 from smart_lidatube.store import Store
 from smart_lidatube.telegram import TelegramBot
 from smart_lidatube.worker import JobWorker
@@ -97,6 +98,13 @@ def build_components():
     )
     store.set_setting("audit_enabled", str(audit_config.enabled).lower())
     store.set_setting("audit_budget_per_hour", audit_config.budget_per_hour)
+    persisted_mode = store.get_setting("audit_mode")
+    configured_mode = env("SMART_AUDIT_MODE", "observe")
+    store.set_setting("audit_mode", persisted_mode if persisted_mode in {"observe", "review", "paused"}
+                      else configured_mode if configured_mode in {"observe", "review", "paused"} else "observe")
+    store.set_setting("app_version", env("SMART_VERSION", "source"))
+    candidate_budget = int(env("SMART_AUDIT_CANDIDATE_SEARCH_BUDGET_PER_HOUR", "0"))
+    store.set_setting("candidate_discovery_budget_per_hour", candidate_budget)
     audit = AuditWorker(
         store,
         lidarr,
@@ -104,11 +112,12 @@ def build_components():
         audit_config,
         lidarr_music_root=env("LIDARR_MUSIC_ROOT") or None,
         audit_music_root=env("SMART_AUDIT_MUSIC_ROOT") or None,
+        probe=FFprobe(timeout=float(env("SMART_FFPROBE_TIMEOUT", "10"))),
     )
     worker.audit_worker = audit
     worker.remediation_dispatcher = RemediationDispatcher(
         store,
-        budget_per_hour=int(env("SMART_AUDIT_CANDIDATE_SEARCH_BUDGET_PER_HOUR", "0")),
+        budget_per_hour=candidate_budget,
         max_token_bank=int(env("SMART_AUDIT_CANDIDATE_SEARCH_MAX_TOKEN_BANK", "2")),
     )
     return worker, poller, telegram

@@ -31,6 +31,20 @@ class Store:
             CREATE INDEX IF NOT EXISTS library_audit_events_report ON library_audit_events(audit_local_day,result_status,lidarr_track_id);
             CREATE TABLE IF NOT EXISTS remediation_queue(id INTEGER PRIMARY KEY,lidarr_track_id INTEGER NOT NULL UNIQUE,reason TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'eligible',job_id INTEGER REFERENCES retry_jobs(id),created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
             CREATE INDEX IF NOT EXISTS remediation_queue_eligible ON remediation_queue(status,id);
+            CREATE TABLE IF NOT EXISTS quality_inventory(
+                lidarr_track_id INTEGER PRIMARY KEY,
+                file_marker TEXT NOT NULL,
+                codec TEXT, container TEXT, bitrate INTEGER, sample_rate INTEGER,
+                bit_depth INTEGER, channels INTEGER, lossless INTEGER,
+                duration REAL, size_band TEXT NOT NULL,
+                source TEXT NOT NULL, confidence TEXT NOT NULL,
+                measured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS control_events(
+                id INTEGER PRIMARY KEY, component TEXT NOT NULL, severity TEXT NOT NULL,
+                code TEXT NOT NULL, template TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}',
+                job_id INTEGER, track_id INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """)
             self._add_columns(c, "retry_jobs", {
                 "updated_at": "TEXT", "last_error": "TEXT", "claimed_at": "TEXT",
@@ -297,6 +311,122 @@ class Store:
     def get_setting(self,key,default=None):
         with self._connect() as c:r=c.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()
         return r[0] if r else default
+    def upsert_quality(self, track_id, file_marker, facts):
+        fields = ("codec", "container", "bitrate", "sample_rate", "bit_depth", "channels",
+                  "lossless", "duration", "size_band", "source", "confidence")
+        values = [facts.get(name) for name in fields]
+        if values[6] is not None:
+            values[6] = int(bool(values[6]))
+        values[8] = values[8] or "unknown"
+        values[9] = values[9] or "unknown"
+        values[10] = values[10] or "unknown"
+        with self._connect() as c:
+            c.execute("""INSERT INTO quality_inventory(
+                lidarr_track_id,file_marker,codec,container,bitrate,sample_rate,bit_depth,
+                channels,lossless,duration,size_band,source,confidence)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(lidarr_track_id) DO UPDATE SET
+                file_marker=excluded.file_marker,codec=excluded.codec,container=excluded.container,
+                bitrate=excluded.bitrate,sample_rate=excluded.sample_rate,bit_depth=excluded.bit_depth,
+                channels=excluded.channels,lossless=excluded.lossless,duration=excluded.duration,
+                size_band=excluded.size_band,source=excluded.source,confidence=excluded.confidence,
+                measured_at=CURRENT_TIMESTAMP""", (track_id, file_marker, *values))
+    def get_quality(self, track_id):
+        with self._connect() as c:
+            row = c.execute("SELECT * FROM quality_inventory WHERE lidarr_track_id=?", (track_id,)).fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        if out["lossless"] is not None:
+            out["lossless"] = bool(out["lossless"])
+        return out
+    @staticmethod
+    def _buckets(rows, denominator):
+        return [{"name": str(name), "count": count,
+                 "percentage": round(count * 100 / denominator, 2) if denominator else 0.0}
+                for name, count in rows]
+    def quality_summary(self):
+        with self._connect() as c:
+            total = c.execute("SELECT COUNT(*) FROM library_audit_tracks").fetchone()[0]
+            measured = c.execute("SELECT COUNT(*) FROM quality_inventory").fetchone()[0]
+            result = {"total": total, "measured": measured, "unknown": max(0, total-measured)}
+            specs = {"formats": ("codec", "codec"), "bitrate": ("bitrate", "bitrate"),
+                     "sample_rate": ("sample_rate", "sample_rate"), "bit_depth": ("bit_depth", "bit_depth"),
+                     "lossless": ("lossless", "CASE lossless WHEN 1 THEN 'lossless' WHEN 0 THEN 'lossy' END")}
+            for key, (column, expression) in specs.items():
+                denominator = c.execute(f"SELECT COUNT(*) FROM quality_inventory WHERE {column} IS NOT NULL").fetchone()[0]
+                rows = c.execute(f"SELECT {expression},COUNT(*) FROM quality_inventory WHERE {column} IS NOT NULL GROUP BY 1 ORDER BY 1").fetchall()
+                result[key] = {"denominator": denominator, "buckets": self._buckets(rows, denominator)}
+            bitrate_rows = c.execute("""SELECT CASE
+                WHEN lossless=1 THEN 'lossless'
+                WHEN bitrate>=320000 THEN '>=320 kbps lossy'
+                WHEN bitrate>=256000 THEN '256-319 kbps'
+                WHEN bitrate>=192000 THEN '192-255 kbps'
+                WHEN bitrate IS NOT NULL THEN '<192 kbps' ELSE 'unknown' END bucket, COUNT(*)
+                FROM quality_inventory GROUP BY bucket ORDER BY CASE bucket
+                WHEN 'lossless' THEN 1 WHEN '>=320 kbps lossy' THEN 2 WHEN '256-319 kbps' THEN 3
+                WHEN '192-255 kbps' THEN 4 WHEN '<192 kbps' THEN 5 ELSE 6 END""").fetchall()
+            result["bitrate_buckets"] = {"denominator": measured, "buckets": self._buckets(bitrate_rows, measured)}
+        return result
+    def dashboard_summary(self):
+        try:
+            heartbeat = float(self.get_setting("worker_heartbeat", "0"))
+            age = max(0, int(datetime.now(timezone.utc).timestamp() - heartbeat)) if heartbeat else None
+        except ValueError:
+            age = None
+        with self._connect() as c:
+            jobs = {}
+            for mode, status, count in c.execute("SELECT mode,status,COUNT(*) FROM retry_jobs GROUP BY mode,status"):
+                jobs.setdefault(mode, {})[status] = count
+            reviews = c.execute("SELECT COUNT(*) FROM retry_jobs WHERE status='awaiting_review'").fetchone()[0]
+            remediation = dict(c.execute("SELECT status,COUNT(*) FROM remediation_queue GROUP BY status"))
+        return {"worker": {"state": self.get_setting("worker_status", "unknown"), "heartbeat_age_seconds": age},
+                "version": self.get_setting("app_version") or None, "audit": self.audit_status(), "jobs": jobs,
+                "reviews": {"awaiting": reviews}, "remediation": remediation,
+                "automation": {"audit_mode": self.get_setting("audit_mode", "observe"),
+                    "candidate_discovery_budget_per_hour": int(self.get_setting("candidate_discovery_budget_per_hour", "0")),
+                    "automatic_auditor_upgrades": False}}
+    def record_event(self, component, severity, code, template, metadata=None, job_id=None, track_id=None):
+        if (component not in {"worker", "audit", "api", "remediation", "import"}
+                or severity not in {"info", "warning", "error"}
+                or code not in {"cycle_ok", "audit_result", "review_action", "mode_changed", "job_state"}
+                or template not in {"worker_cycle", "audit_classification", "candidate_review", "audit_mode", "job_transition"}):
+            return False
+        safe = {key: value for key, value in (metadata or {}).items()
+                if key in {"count", "status", "mode", "reason"} and isinstance(value, (str, int, float, bool))
+                and not any(part in str(value).lower() for part in ("/", "http", "token", "password"))}
+        with self._connect() as c:
+            c.execute("INSERT INTO control_events(component,severity,code,template,metadata,job_id,track_id) VALUES(?,?,?,?,?,?,?)",
+                      (component, severity, code, template, json.dumps(safe), job_id, track_id))
+        return True
+    def list_events(self, cursor, limit):
+        with self._connect() as c:
+            rows = c.execute("SELECT * FROM control_events WHERE id>? ORDER BY id LIMIT ?", (cursor, limit)).fetchall()
+        return [{"id": row["id"], "component": row["component"], "severity": row["severity"],
+                 "code": row["code"], "template": row["template"], "metadata": json.loads(row["metadata"]),
+                 "job_id": f"job:{row['job_id']}" if row["job_id"] is not None else None,
+                 "track_id": f"track:{row['track_id']}" if row["track_id"] is not None else None,
+                 "created_at": row["created_at"]} for row in rows]
+    def list_safe_jobs(self, cursor, limit):
+        with self._connect() as c:
+            rows = c.execute("SELECT id,lidarr_track_id,mode,status,retry_count,created_at,updated_at FROM retry_jobs WHERE id>? ORDER BY id LIMIT ?", (cursor, limit)).fetchall()
+        return [{"id": f"job:{row['id']}", "track_id": f"track:{row['lidarr_track_id']}",
+                 "mode": row["mode"], "status": row["status"], "retry_count": row["retry_count"],
+                 "created_at": row["created_at"], "updated_at": row["updated_at"]} for row in rows]
+    def safe_job(self, job_id):
+        with self._connect() as c:
+            row = c.execute("SELECT id,lidarr_track_id,mode,status,retry_count,created_at,updated_at FROM retry_jobs WHERE id=?", (job_id,)).fetchone()
+        return ({"id": f"job:{row['id']}", "track_id": f"track:{row['lidarr_track_id']}",
+                 "mode": row["mode"], "status": row["status"], "retry_count": row["retry_count"],
+                 "created_at": row["created_at"], "updated_at": row["updated_at"]} if row else None)
+    def list_safe_reviews(self, cursor, limit):
+        with self._connect() as c:
+            rows = c.execute("""SELECT a.id,j.id job_id,j.lidarr_track_id,j.mode,j.metadata,a.created_at
+                FROM source_attempts a JOIN retry_jobs j ON j.id=a.job_id
+                WHERE a.verdict='awaiting_review' AND a.id>? ORDER BY a.id LIMIT ?""", (cursor, limit)).fetchall()
+        return [{"attempt_id": row["id"], "job_id": f"job:{row['job_id']}",
+                 "track_id": f"track:{row['lidarr_track_id']}", "mode": row["mode"],
+                 "audit_origin": bool(json.loads(row["metadata"] or "{}").get("audit_remediation")),
+                 "created_at": row["created_at"]} for row in rows]
     def set_audit_bootstrap_state(self, status, error, count, cursor):
         """Persist only bounded, public-safe bootstrap diagnostics."""
         status = status if status in {"ok", "partial", "failed"} else "failed"

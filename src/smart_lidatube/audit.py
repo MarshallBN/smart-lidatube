@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from smart_lidatube.path_mapping import map_lidarr_music_path
+from smart_lidatube.quality import ProbeError, media_quality
 
 AUDIT_STATUSES = {"never_checked", "verified", "likely_correct", "suspect", "unverifiable", "unavailable", "exempt"}
 
@@ -33,11 +34,12 @@ def recheck_seconds(status, count=0):
 class AuditWorker:
     """Audits an already-organized Lidarr target, without source or import APIs."""
     def __init__(self, store, lidarr, verifier, config=None, clock=None,
-                 lidarr_music_root=None, audit_music_root=None):
+                 lidarr_music_root=None, audit_music_root=None, probe=None):
         self.store, self.lidarr, self.verifier = store, lidarr, verifier
         self.config, self.clock = config or AuditConfig(), clock or (lambda: datetime.now(timezone.utc))
         self.lidarr_music_root = lidarr_music_root
         self.audit_music_root = audit_music_root
+        self.probe = probe
 
     def _token(self):
         now=self.clock().timestamp(); raw=self.store.get_setting("audit_tokens")
@@ -76,7 +78,8 @@ class AuditWorker:
         return added
 
     def process_once(self):
-        if not self.config.enabled or self.store.audit_work_pending(): return None
+        if (not self.config.enabled or self.store.get_setting("audit_mode", "observe") == "paused"
+                or self.store.audit_work_pending()): return None
         row=self.store.select_audit_candidate(self.config.fairness_share)
         if not row or not self._token(): return None
         track_id=row["lidarr_track_id"]
@@ -91,6 +94,18 @@ class AuditWorker:
                 self._save(track_id,"unavailable",{"reason":"target_file_missing","artist":identity.get("artist", ""),"title":identity.get("title", "")},count=row["check_count"]); return track_id
             marker=f"{path.stat().st_size}:{int(path.stat().st_mtime)}"
             result=self.verifier.verify_file(path,identity); status=classify_verification(result)
+            media_info = (target or {}).get("mediaInfo") or {}
+            complete = ((media_info.get("audioCodec") or media_info.get("audioFormat")) is not None
+                        and all(media_info.get(key) is not None for key in
+                                ("containerFormat", "audioBitrate", "audioSampleRate",
+                                 "audioBits", "audioChannels", "duration")))
+            probed = None
+            if self.probe and not complete:
+                try:
+                    probed = self.probe.probe(path)
+                except ProbeError:
+                    probed = None
+            self.store.upsert_quality(track_id, marker, media_quality(media_info, probed, path.stat().st_size))
             self._save(track_id,status,{"reason":result.reason,"artist":identity.get("artist", ""),"title":identity.get("title", "")},marker,row["check_count"])
         except Exception:
             self._save(track_id,"unverifiable",{"reason":"audit_system_error"},count=row["check_count"])
