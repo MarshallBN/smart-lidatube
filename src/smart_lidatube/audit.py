@@ -1,8 +1,9 @@
 """Read-only library integrity scheduling and verification."""
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from zoneinfo import ZoneInfo
+
+from smart_lidatube.path_mapping import map_lidarr_music_path
 
 AUDIT_STATUSES = {"never_checked", "verified", "likely_correct", "suspect", "unverifiable", "unavailable", "exempt"}
 
@@ -31,9 +32,12 @@ def recheck_seconds(status, count=0):
 
 class AuditWorker:
     """Audits an already-organized Lidarr target, without source or import APIs."""
-    def __init__(self, store, lidarr, verifier, config=None, clock=None):
+    def __init__(self, store, lidarr, verifier, config=None, clock=None,
+                 lidarr_music_root=None, audit_music_root=None):
         self.store, self.lidarr, self.verifier = store, lidarr, verifier
         self.config, self.clock = config or AuditConfig(), clock or (lambda: datetime.now(timezone.utc))
+        self.lidarr_music_root = lidarr_music_root
+        self.audit_music_root = audit_music_root
 
     def _token(self):
         now=self.clock().timestamp(); raw=self.store.get_setting("audit_tokens")
@@ -80,8 +84,10 @@ class AuditWorker:
             track=self.lidarr.get_track(track_id); identity=self.lidarr.track_identity(track)
             file_id=identity.get("track_file_id") or track.get("trackFileId")
             target=self.lidarr.get_track_file(file_id) if file_id else None
-            path=Path((target or {}).get("path", ""))
-            if not path.is_file():
+            path=map_lidarr_music_path(
+                (target or {}).get("path", ""), self.lidarr_music_root, self.audit_music_root
+            )
+            if path is None or not path.is_file():
                 self._save(track_id,"unavailable",{"reason":"target_file_missing","artist":identity.get("artist", ""),"title":identity.get("title", "")},count=row["check_count"]); return track_id
             marker=f"{path.stat().st_size}:{int(path.stat().st_mtime)}"
             result=self.verifier.verify_file(path,identity); status=classify_verification(result)

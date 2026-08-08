@@ -97,7 +97,14 @@ def build_components():
     )
     store.set_setting("audit_enabled", str(audit_config.enabled).lower())
     store.set_setting("audit_budget_per_hour", audit_config.budget_per_hour)
-    audit = AuditWorker(store, lidarr, verifier, audit_config)
+    audit = AuditWorker(
+        store,
+        lidarr,
+        verifier,
+        audit_config,
+        lidarr_music_root=env("LIDARR_MUSIC_ROOT") or None,
+        audit_music_root=env("SMART_AUDIT_MUSIC_ROOT") or None,
+    )
     worker.audit_worker = audit
     worker.remediation_dispatcher = RemediationDispatcher(
         store,

@@ -184,6 +184,17 @@ def test_runner_wires_all_worker_lifecycle_settings(monkeypatch, tmp_path):
     assert worker.import_verify_timeout == 17
 
 
+def test_runner_wires_explicit_audit_library_mapping(monkeypatch, tmp_path):
+    monkeypatch.setenv("SMART_DB_PATH", str(tmp_path / "db"))
+    monkeypatch.setenv("LIDARR_MUSIC_ROOT", "/Music")
+    monkeypatch.setenv("SMART_AUDIT_MUSIC_ROOT", "/music")
+
+    worker, _, _ = build_components()
+
+    assert worker.audit_worker.lidarr_music_root == "/Music"
+    assert worker.audit_worker.audit_music_root == "/music"
+
+
 def test_build_components_retains_three_item_public_return(monkeypatch, tmp_path):
     monkeypatch.setenv("SMART_DB_PATH", str(tmp_path / "db"))
     components = build_components()

@@ -59,13 +59,49 @@ def test_budget_idle_guard_and_read_only_single_track_audit(tmp_path):
             return Verification("accepted", "recording_match", {})
     media = tmp_path / "organized.m4a"; media.write_bytes(b"audio")
     store = Store(tmp_path / "audit.db"); store.upsert_audit_track(8, priority_score=100)
-    worker = AuditWorker(store, Lidarr(), Verifier(), AuditConfig(budget_per_hour=1, max_token_bank=2))
+    worker = AuditWorker(
+        store, Lidarr(), Verifier(), AuditConfig(budget_per_hour=1, max_token_bank=2),
+        lidarr_music_root=str(tmp_path), audit_music_root=str(tmp_path),
+    )
     assert worker.process_once() == 8
     assert store.get_audit_track(8)["status"] == "verified"
     assert worker.process_once() is None  # token budget
     store.upsert_audit_track(10, priority_score=100)
     store.enqueue_job(99, "user-work")
     assert worker.process_once() is None  # queued retry wins
+
+
+def test_auditor_fingerprints_translated_read_only_library_file(tmp_path):
+    class Lidarr:
+        def get_track(self, track_id):
+            return {"id": track_id, "trackFileId": 9, "title": "Song", "artist": {"artistName": "Artist"}}
+
+        def get_track_file(self, file_id):
+            return {"id": file_id, "path": "/Music/Artist/Song.mp3"}
+
+        @staticmethod
+        def track_identity(track):
+            return {"artist": "Artist", "title": "Song", "track_file_id": 9}
+
+    class Verifier:
+        def verify_file(self, path, identity):
+            assert Path(path) == media
+            return Verification("accepted", "recording_match", {})
+
+    media = tmp_path / "music" / "Artist" / "Song.mp3"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"audio")
+    store = Store(tmp_path / "audit.db")
+    store.upsert_audit_track(8)
+    worker = AuditWorker(
+        store, Lidarr(), Verifier(), AuditConfig(),
+        lidarr_music_root="/Music", audit_music_root=str(tmp_path / "music"),
+    )
+
+    assert worker.process_once() == 8
+    row = store.get_audit_track(8)
+    assert row["status"] == "verified"
+    assert str(tmp_path) not in str(row["evidence_json"])
 
 
 def test_import_attention_does_not_block_audit_bootstrap_or_processing(tmp_path):
@@ -112,7 +148,10 @@ def test_missing_file_and_exception_never_persist_raw_error_or_side_effects(tmp_
         @staticmethod
         def track_identity(track): return {"artist": "Artist", "title": "Song"}
     store = Store(tmp_path / "audit.db"); store.upsert_audit_track(1)
-    assert AuditWorker(store, Lidarr(), object(), AuditConfig()).process_once() == 1
+    assert AuditWorker(
+        store, Lidarr(), object(), AuditConfig(),
+        lidarr_music_root=str(tmp_path), audit_music_root=str(tmp_path),
+    ).process_once() == 1
     row = store.get_audit_track(1)
     assert row["status"] == "unavailable"
     assert str(tmp_path) not in str(row["evidence_json"])

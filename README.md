@@ -106,6 +106,8 @@ The smart worker also contains a conservative library auditor. It records a sepa
 
 Set `SMART_AUDIT_ENABLED=true` to enable it (default budget: `SMART_AUDIT_VERIFY_BUDGET_PER_HOUR=12`; capped carryover: `SMART_AUDIT_MAX_TOKEN_BANK=24`). The auditor yields whenever a normal retry/import/review job exists and reserves every fifth eligible selection for the longest-unchecked track (`SMART_AUDIT_FAIRNESS_SHARE=0.20`). Candidate discovery stays disabled (`SMART_AUDIT_CANDIDATE_SEARCH_BUDGET_PER_HOUR=0`). Inspect aggregate progress through authenticated `GET /api/smart/audit/status`.
 
+For read-only audit visibility, configure the exact Lidarr path prefix and worker mount separately: `LIDARR_MUSIC_ROOT=/Music` and `SMART_AUDIT_MUSIC_ROOT=/music`. Mount `/mnt/PizzaPool/MediaServer/Music2:/music:ro` **only** in `smart-worker`; do not add this library mount to the application service. The auditor maps only paths beneath `LIDARR_MUSIC_ROOT`, rejects traversal or unmapped paths, and records generic unavailable evidence rather than raw paths. If either mapping variable is unset, the audit fails closed and does not inspect a file.
+
 Telegram audit summaries are report-only and deduplicated per day in SQLite. They are sent only when classifications changed (unless `SMART_AUDIT_REPORT_EMPTY=true`) and detail callbacks are paginated. Audit persistence and reports deliberately retain only safe category/reason and track display fields—never paths, URLs, raw exceptions, headers, or credentials.
 
 ### Operational recovery and runbook
