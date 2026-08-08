@@ -77,3 +77,21 @@ def quality_decision(current, candidate, *, edition_match=None, identity_verifie
     # No YouTube-derived source fact can prove quality solely from a label or
     # bitrate. A human may inspect a verified staged candidate instead.
     return "review_only"
+
+
+def auto_quality_decision(current, candidate, *, edition_match=None, identity_verified=True):
+    """Approve only a measured, meaningful improvement; unknowns fail closed."""
+    if not identity_verified or edition_match is False:
+        return "rejected"
+    current_codec = str(current.get("codec") or "").lower()
+    candidate_codec = str(candidate.get("codec") or "").lower()
+    if current.get("verified") and current_codec in LOSSLESS_CODECS:
+        return "rejected"
+    if not candidate_codec or candidate.get("bitrate") is None:
+        return "rejected"
+    if candidate_codec in LOSSLESS_CODECS and current_codec not in LOSSLESS_CODECS:
+        return "auto_approved"
+    old, new = current.get("bitrate"), candidate.get("bitrate")
+    if old is not None and new >= max(int(old * 1.25), old + 64000):
+        return "auto_approved"
+    return "rejected"

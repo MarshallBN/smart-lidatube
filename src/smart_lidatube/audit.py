@@ -1,5 +1,6 @@
 """Read-only library integrity scheduling and verification."""
 from dataclasses import dataclass
+import math
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -7,6 +8,14 @@ from smart_lidatube.path_mapping import map_lidarr_music_path
 from smart_lidatube.quality import ProbeError, media_quality
 
 AUDIT_STATUSES = {"never_checked", "verified", "likely_correct", "suspect", "unverifiable", "unavailable", "exempt"}
+
+def audit_rate_tier(backlog):
+    if backlog > 10_000: return 300
+    if backlog > 5_000: return 200
+    if backlog > 1_000: return 120
+    if backlog > 100: return 60
+    if backlog > 0: return 24
+    return 12
 
 @dataclass
 class AuditConfig:
@@ -34,17 +43,29 @@ def recheck_seconds(status, count=0):
 class AuditWorker:
     """Audits an already-organized Lidarr target, without source or import APIs."""
     def __init__(self, store, lidarr, verifier, config=None, clock=None,
-                 lidarr_music_root=None, audit_music_root=None, probe=None):
+                 lidarr_music_root=None, audit_music_root=None, probe=None,
+                 health_check=None, resource_check=None):
         self.store, self.lidarr, self.verifier = store, lidarr, verifier
         self.config, self.clock = config or AuditConfig(), clock or (lambda: datetime.now(timezone.utc))
         self.lidarr_music_root = lidarr_music_root
         self.audit_music_root = audit_music_root
         self.probe = probe
+        self.health_check = health_check or (lambda: True)
+        self.resource_check = resource_check or (lambda: True)
+
+    def refresh_throughput(self):
+        backlog = self.store.audit_backlog()
+        tier = audit_rate_tier(backlog)
+        effective = min(max(0, self.config.budget_per_hour), tier)
+        eta = math.ceil(backlog / effective * 100) / 100 if effective else None
+        self.store.set_audit_throughput(backlog, tier, effective, eta)
+        return effective
 
     def _token(self):
         now=self.clock().timestamp(); raw=self.store.get_setting("audit_tokens")
         tokens, updated = (self.config.max_token_bank, now) if not raw else map(float, raw.split(":"))
-        tokens=min(self.config.max_token_bank, tokens+(now-updated)*self.config.budget_per_hour/3600)
+        rate = self.refresh_throughput()
+        tokens=min(self.config.max_token_bank, tokens+(now-updated)*rate/3600)
         if tokens < 1:
             self.store.set_setting("audit_tokens",f"{tokens}:{now}"); return False
         self.store.set_setting("audit_tokens",f"{tokens-1}:{now}"); return True
@@ -80,6 +101,18 @@ class AuditWorker:
     def process_once(self):
         if (not self.config.enabled or self.store.get_setting("audit_mode", "observe") == "paused"
                 or self.store.audit_work_pending()): return None
+        try:
+            if not self.health_check():
+                raise RuntimeError("unhealthy")
+        except Exception:
+            self.store.set_setting("audit_backoff_reason", "health_unavailable")
+            return None
+        try:
+            if not self.resource_check():
+                raise RuntimeError("busy")
+        except Exception:
+            self.store.set_setting("audit_backoff_reason", "resource_unavailable")
+            return None
         row=self.store.select_audit_candidate(self.config.fairness_share)
         if not row or not self._token(): return None
         track_id=row["lidarr_track_id"]

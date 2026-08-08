@@ -67,9 +67,13 @@ class Store:
                 "import_checked_at": "TEXT", "notification_attempt_id": "INTEGER",
                 "notification_chat_id": "INTEGER", "notification_text": "TEXT",
                 "notification_evidence": "TEXT",
+                "requested_at": "TEXT", "sla_deadline": "TEXT",
             })
             self._add_columns(c,"source_attempts",{"staged_path":"TEXT","updated_at":"TEXT","artifact_manifest":"TEXT"})
             self._add_columns(c,"remediation_queue",{"job_id":"INTEGER REFERENCES retry_jobs(id)"})
+            c.execute("""UPDATE retry_jobs SET requested_at=COALESCE(requested_at,created_at),
+                sla_deadline=CASE WHEN mode='auto' THEN COALESCE(sla_deadline,datetime(created_at,'+24 hours')) END
+                WHERE requested_at IS NULL OR (mode='auto' AND sla_deadline IS NULL)""")
             self._add_columns(c,"library_audit_events",{"audit_local_day":"TEXT"})
             # Rebuild this index after adding the local-day reporting key.
             c.execute("DROP INDEX IF EXISTS library_audit_events_report")
@@ -93,7 +97,10 @@ class Store:
 
     def enqueue_job(self,track_id,idempotency_key,mode="auto",metadata=None,prior_source="unknown"):
         with self._connect() as c:
-            c.execute("INSERT OR IGNORE INTO retry_jobs(lidarr_track_id,idempotency_key,mode,metadata,prior_source) VALUES(?,?,?,?,?)",(track_id,idempotency_key,mode,json.dumps(metadata or {}),prior_source))
+            c.execute("""INSERT OR IGNORE INTO retry_jobs(
+                lidarr_track_id,idempotency_key,mode,metadata,prior_source,requested_at,sla_deadline)
+                VALUES(?,?,?,?,?,CURRENT_TIMESTAMP,CASE WHEN ?='auto' THEN datetime('now','+24 hours') END)""",
+                (track_id,idempotency_key,mode,json.dumps(metadata or {}),prior_source,mode))
             return c.execute("SELECT id FROM retry_jobs WHERE idempotency_key=?",(idempotency_key,)).fetchone()["id"]
 
     def enqueue_occurrence(self,track_id,key,mode,metadata):
@@ -102,7 +109,10 @@ class Store:
             row=c.execute("SELECT job_id FROM ingestion_occurrences WHERE occurrence_key=? AND consumed_at IS NULL",(key,)).fetchone()
             if row: return row["job_id"],False
             unique=f"{key}:generation:{uuid4()}"
-            cur=c.execute("INSERT INTO retry_jobs(lidarr_track_id,idempotency_key,mode,metadata,prior_source) VALUES(?,?,?,?,?)",(track_id,unique,mode,json.dumps(metadata),"unknown"))
+            cur=c.execute("""INSERT INTO retry_jobs(
+                lidarr_track_id,idempotency_key,mode,metadata,prior_source,requested_at,sla_deadline)
+                VALUES(?,?,?,?,?,CURRENT_TIMESTAMP,CASE WHEN ?='auto' THEN datetime('now','+24 hours') END)""",
+                (track_id,unique,mode,json.dumps(metadata),"unknown",mode))
             job=cur.lastrowid; c.execute("INSERT INTO ingestion_occurrences(occurrence_key,job_id) VALUES(?,?)",(key,job)); return job,True
 
     def consume_occurrence(self,job_id):
@@ -130,9 +140,15 @@ class Store:
 
     def schedule_retry(self,job_id,error,delay=30,max_attempts=5):
         with self._connect() as c:
-            row=c.execute("SELECT retry_count FROM retry_jobs WHERE id=?",(job_id,)).fetchone(); count=row[0]+1
-            status="failed" if count>=max_attempts else "queued"
-            c.execute("UPDATE retry_jobs SET status=?,retry_count=?,next_attempt_at=datetime('now',?),last_error=?,claim_token=NULL,claimed_at=NULL WHERE id=?",(status,count,f"+{int(delay)} seconds",error,job_id))
+            row=c.execute("SELECT retry_count,mode,sla_deadline FROM retry_jobs WHERE id=?",(job_id,)).fetchone(); count=row[0]+1
+            expired = bool(row["sla_deadline"] and c.execute("SELECT ?<=CURRENT_TIMESTAMP",(row["sla_deadline"],)).fetchone()[0])
+            terminal = count>=max_attempts or expired
+            status="operator_attention" if row["mode"]=="auto" and terminal else "failed" if terminal else "queued"
+            bounded_delay=min(3600,max(1,int(delay))*(2**max(0,count-1)))
+            c.execute("""UPDATE retry_jobs SET status=?,retry_count=?,
+                next_attempt_at=CASE WHEN ?='queued' THEN datetime('now',?) END,
+                last_error=?,claim_token=NULL,claimed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (status,count,status,f"+{bounded_delay} seconds",error,job_id))
             c.execute("UPDATE remediation_queue SET status=?,updated_at=CURRENT_TIMESTAMP WHERE job_id=?",(status,job_id))
 
     def prepare_import(self, job_id, prior_file_id, path):
@@ -426,18 +442,21 @@ class Store:
                  "job_id": f"job:{row['job_id']}" if row["job_id"] is not None else None,
                  "track_id": f"track:{row['track_id']}" if row["track_id"] is not None else None,
                  "created_at": row["created_at"]} for row in rows]
+    @staticmethod
+    def _safe_job_row(row):
+        return {"id": f"job:{row['id']}", "track_id": f"track:{row['lidarr_track_id']}",
+                "mode": row["mode"], "status": row["status"], "retry_count": row["retry_count"],
+                "requested_at": row["requested_at"], "sla_deadline": row["sla_deadline"],
+                "next_attempt_at": row["next_attempt_at"],
+                "created_at": row["created_at"], "updated_at": row["updated_at"]}
     def list_safe_jobs(self, cursor, limit):
         with self._connect() as c:
-            rows = c.execute("SELECT id,lidarr_track_id,mode,status,retry_count,created_at,updated_at FROM retry_jobs WHERE id>? ORDER BY id LIMIT ?", (cursor, limit)).fetchall()
-        return [{"id": f"job:{row['id']}", "track_id": f"track:{row['lidarr_track_id']}",
-                 "mode": row["mode"], "status": row["status"], "retry_count": row["retry_count"],
-                 "created_at": row["created_at"], "updated_at": row["updated_at"]} for row in rows]
+            rows = c.execute("SELECT id,lidarr_track_id,mode,status,retry_count,requested_at,sla_deadline,next_attempt_at,created_at,updated_at FROM retry_jobs WHERE id>? ORDER BY id LIMIT ?", (cursor, limit)).fetchall()
+        return [self._safe_job_row(row) for row in rows]
     def safe_job(self, job_id):
         with self._connect() as c:
-            row = c.execute("SELECT id,lidarr_track_id,mode,status,retry_count,created_at,updated_at FROM retry_jobs WHERE id=?", (job_id,)).fetchone()
-        return ({"id": f"job:{row['id']}", "track_id": f"track:{row['lidarr_track_id']}",
-                 "mode": row["mode"], "status": row["status"], "retry_count": row["retry_count"],
-                 "created_at": row["created_at"], "updated_at": row["updated_at"]} if row else None)
+            row = c.execute("SELECT id,lidarr_track_id,mode,status,retry_count,requested_at,sla_deadline,next_attempt_at,created_at,updated_at FROM retry_jobs WHERE id=?", (job_id,)).fetchone()
+        return self._safe_job_row(row) if row else None
     @staticmethod
     def _review_cursor(updated_at, attempt_id):
         raw = json.dumps([updated_at, attempt_id], separators=(",", ":")).encode()
@@ -618,7 +637,25 @@ class Store:
             "error_count": bootstrap_count,
             "cursor": cursor if cursor.startswith("albums:") else "albums:0",
         }
-        return {"checked_total":checked,"eligible_total":eligible,"total":total,"enabled":self.get_setting("audit_enabled","true")=="true","budget_per_hour":int(self.get_setting("audit_budget_per_hour","12")),"tokens_available":int(float((self.get_setting("audit_tokens", "0:0")).split(":")[0])),"bootstrap":bootstrap,**counts}
+        def numeric(key, default, kind=int):
+            try: return kind(self.get_setting(key, str(default)))
+            except (TypeError, ValueError): return default
+        eta_raw = self.get_setting("audit_eta_hours")
+        return {"checked_total":checked,"eligible_total":eligible,"total":total,
+                "backlog":numeric("audit_backlog", eligible),
+                "tier_rate_per_hour":numeric("audit_tier_rate_per_hour", 12),
+                "effective_rate_per_hour":numeric("audit_effective_rate_per_hour", 12),
+                "eta_hours":numeric("audit_eta_hours", None, float) if eta_raw not in (None, "") else None,
+                "backoff_reason":self.get_setting("audit_backoff_reason") or None,
+                "enabled":self.get_setting("audit_enabled","true")=="true","budget_per_hour":int(self.get_setting("audit_budget_per_hour","12")),"tokens_available":int(float((self.get_setting("audit_tokens", "0:0")).split(":")[0])),"bootstrap":bootstrap,**counts}
+    def audit_backlog(self):
+        with self._connect() as c:
+            return c.execute("SELECT COUNT(*) FROM library_audit_tracks WHERE do_not_audit=0 AND (next_check_at IS NULL OR next_check_at<=CURRENT_TIMESTAMP)").fetchone()[0]
+    def set_audit_throughput(self, backlog, tier, effective, eta):
+        for key, value in (("audit_backlog", backlog), ("audit_tier_rate_per_hour", tier),
+                           ("audit_effective_rate_per_hour", effective),
+                           ("audit_eta_hours", "" if eta is None else eta)):
+            self.set_setting(key, value)
     def audit_digest_events(self,date):
         with self._connect() as c:rows=c.execute("SELECT lidarr_track_id,result_status,evidence_json FROM library_audit_events WHERE audit_local_day=? AND event_type='classification_change' ORDER BY id",(date,)).fetchall()
         return [self._decode(row,("evidence_json",)) for row in rows]

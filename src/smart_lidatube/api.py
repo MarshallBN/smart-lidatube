@@ -186,13 +186,18 @@ def register_api(app, store, token):
     @app.get("/smart-control")
     def control_page():
         return Response("""<!doctype html><meta charset=utf-8><title>Smart LidaTube Control</title>
-<style>body{font:16px system-ui;max-width:1100px;margin:auto;background:#111;color:#eee}section{border:1px solid #444;margin:1rem;padding:1rem}pre{white-space:pre-wrap}</style>
+<style>body{font:16px system-ui;max-width:1200px;margin:auto;background:#111;color:#eee}section{border:1px solid #444;margin:1rem;padding:1rem}pre{white-space:pre-wrap}button,select,input{margin:.25rem;padding:.4rem}</style>
 <h1>Smart LidaTube Control</h1><button onclick='connect()'>Connect</button>
 <section><h2>Dashboard</h2><pre id=dashboard></pre></section><section><h2>Quality</h2><pre id=quality></pre></section>
-<section><h2>Reviews</h2><pre id=reviews></pre></section><section><h2>Jobs</h2><pre id=jobs></pre></section>
-<section><h2>Events</h2><pre id=events></pre></section><script>
-let token = ''; async function load(name,path){let r=await fetch(path,{headers:{Authorization:'Bearer '+token}});document.getElementById(name).textContent=JSON.stringify(await r.json(),null,2)}
-function connect(){token=prompt('API token')||'';load('dashboard','/api/smart/dashboard/summary');load('quality','/api/smart/quality');load('reviews','/api/smart/reviews');load('jobs','/api/smart/jobs');load('events','/api/smart/events')}
+<section><h2>Reviews</h2><pre id=reviews></pre><h3>Actions</h3><input id=attempt placeholder='Attempt ID'><select id=action><option>accept</option><option>reject</option><option>cancel</option><option>ignore_track</option><option>audit_later</option></select><button onclick='reviewAction()'>Apply</button></section>
+<section><h2>Jobs</h2><pre id=jobs></pre><h3>Timing</h3><p>Requested, next attempt, retry count, and 24-hour SLA deadline are shown with each job.</p></section>
+<section><h2>Audit Controls</h2><button onclick=controlAudit('observe')>observe</button><button onclick=controlAudit('review')>review</button><button onclick=controlAudit('paused')>paused</button><pre id=audit></pre></section>
+<section><h2>Events</h2><pre id=events></pre></section><section><h2>Playlist Integration</h2><p>Coming soon: register and monitor playlist sources. No download action is enabled here.</p></section><script>
+let token = ''; const headers=()=>({Authorization:'Bearer '+token,'Content-Type':'application/json'});
+async function load(name,path){let r=await fetch(path,{headers:headers()});document.getElementById(name).textContent=JSON.stringify(await r.json(),null,2)}
+async function reviewAction(){let id=document.getElementById('attempt').value,a=document.getElementById('action').value;await fetch('/api/smart/reviews/'+id+'/action',{method:'POST',headers:headers(),body:JSON.stringify({action:a})});load('reviews','/api/smart/reviews')}
+async function controlAudit(mode){await fetch('/api/smart/audit/control',{method:'POST',headers:headers(),body:JSON.stringify({mode})});load('audit','/api/smart/audit/status');load('dashboard','/api/smart/dashboard/summary')}
+function connect(){token=prompt('API token')||'';load('dashboard','/api/smart/dashboard/summary');load('quality','/api/smart/quality');load('reviews','/api/smart/reviews');load('jobs','/api/smart/jobs');load('audit','/api/smart/audit/status');load('events','/api/smart/events')}
 </script>""", mimetype="text/html")
 
     @app.get("/health")

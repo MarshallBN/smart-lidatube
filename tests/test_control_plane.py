@@ -217,9 +217,22 @@ def test_audit_control_allowlist_persists_and_pause_prevents_checks(tmp_path):
     assert client.post("/api/smart/audit/control", json={"mode": "review"}, headers=AUTH).status_code == 202
 
 
-def test_control_page_has_sections_and_keeps_token_only_in_memory(tmp_path):
+def test_control_page_has_operational_sections_actions_and_keeps_token_only_in_memory(tmp_path):
     html = create_api(Store(tmp_path / "db"), "secret").test_client().get("/smart-control").get_data(as_text=True)
-    for section in ("Dashboard", "Quality", "Reviews", "Jobs", "Events"):
+    for section in ("Dashboard", "Quality", "Reviews", "Actions", "Jobs", "Timing", "Audit Controls", "Events", "Playlist Integration"):
         assert section in html
+    for action in ("accept", "reject", "cancel", "ignore_track", "audit_later"):
+        assert action in html
+    for mode in ("observe", "review", "paused"):
+        assert mode in html
+    assert "auto_safe" not in html
     assert "localStorage" not in html and "sessionStorage" not in html
     assert "let token" in html and "SMART_API_TOKEN" not in html
+
+
+def test_safe_job_dto_exposes_timing_without_private_metadata(tmp_path):
+    store = Store(tmp_path / "db")
+    job = store.enqueue_job(1, "private-key", mode="auto", metadata={"url": "https://secret"})
+    body = create_api(store, "secret").test_client().get(f"/api/smart/jobs/{job}", headers=AUTH).get_json()
+    assert set(("requested_at", "sla_deadline", "next_attempt_at", "retry_count")) <= body.keys()
+    assert "metadata" not in body and "private-key" not in str(body)

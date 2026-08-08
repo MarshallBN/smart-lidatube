@@ -74,6 +74,7 @@ def build_components():
         max_attempts=int(env("SMART_MAX_ATTEMPTS", "5")),
         import_verify_interval=float(env("SMART_IMPORT_VERIFY_INTERVAL", "10")),
         import_verify_timeout=float(env("SMART_IMPORT_VERIFY_TIMEOUT", "900")),
+        candidate_probe=FFprobe(timeout=float(env("SMART_FFPROBE_TIMEOUT", "10"))),
     )
     poller = None
     nav_url = env("NAVIDROME_URL")

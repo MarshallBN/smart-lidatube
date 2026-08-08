@@ -6,7 +6,7 @@ from pathlib import Path
 
 from smart_lidatube.audit_origin import is_audit_origin
 from smart_lidatube.retry import filter_candidates
-from smart_lidatube.quality import quality_decision
+from smart_lidatube.quality import auto_quality_decision, quality_decision
 
 
 def translate_staged_path(path, downloads_root, lidarr_downloads_root):
@@ -28,7 +28,7 @@ class JobWorker:
         self, store, lidarr, sources, verifier, downloads_root, telegram=None,
         review_chat_id=None, lidarr_downloads_root=None, lease_seconds=300,
         retry_delay=30, max_attempts=5, import_verify_interval=10,
-        import_verify_timeout=900,
+        import_verify_timeout=900, candidate_probe=None,
     ):
         self.store = store
         self.lidarr = lidarr
@@ -43,6 +43,7 @@ class JobWorker:
         self.max_attempts = max_attempts
         self.import_verify_interval = import_verify_interval
         self.import_verify_timeout = import_verify_timeout
+        self.candidate_probe = candidate_probe
 
     def process_once(self):
         job = self.store.claim_job(self.lease_seconds)
@@ -166,6 +167,10 @@ class JobWorker:
         return self.downloads_root / relative
 
     def _process(self, job):
+        if (job["mode"] == "auto" and job.get("sla_deadline")
+                and self._age(job["sla_deadline"]) >= 0):
+            self.store.update_job(job["id"], "operator_attention", error="auto_retry_deadline_expired")
+            return
         accepted = self._accepted_attempt(job["id"])
         track = self.lidarr.get_track(job["lidarr_track_id"])
         if accepted:
@@ -232,14 +237,36 @@ class JobWorker:
                     candidate["source_id"], attempt_id,
                 )
                 continue
-            if audit_origin and verification.verdict == "accepted":
+            if verification.verdict == "accepted" and job["mode"] == "auto" and not audit_origin:
+                candidate_quality = verification.evidence or {}
+                if self.candidate_probe:
+                    try:
+                        candidate_quality = {**candidate_quality, **self.candidate_probe.probe(staged)}
+                    except Exception:
+                        candidate_quality = {}
+                if auto_quality_decision(
+                    self.store.get_quality(job["lidarr_track_id"]) or current_quality,
+                    candidate_quality,
+                    edition_match=candidate_quality.get("edition_match"),
+                    identity_verified=True,
+                ) != "auto_approved":
+                    self.store.update_attempt(attempt_id, verdict="rejected",
+                                              evidence={"reason": "auto_quality_policy"}, staged_path=staged)
+                    self.store.reject(job["lidarr_track_id"], candidate["provider"],
+                                      candidate["source_id"], attempt_id)
+                    continue
+            if verification.verdict == "accepted" and (audit_origin or job["mode"] == "auto"):
                 self.store.capture_artifact_manifest(attempt_id, staged)
             if verification.verdict == "accepted" and job["mode"] == "auto" and not audit_origin:
                 self._import(job, track, self.store.get_attempt(attempt_id))
                 return
             self._request_review(job, attempt_id, candidate, verification)
             return
-        self.store.update_job(job["id"], "exhausted", error="no candidates remain")
+        if job["mode"] == "auto":
+            self.store.schedule_retry(job["id"], "no_policy_approved_candidate",
+                                      self.retry_delay, self.max_attempts)
+        else:
+            self.store.update_job(job["id"], "exhausted", error="no candidates remain")
 
     def _current_quality(self, identity, track_id):
         """Use Lidarr's track-file facts only; never infer quality from its path."""
@@ -295,8 +322,11 @@ class JobWorker:
         return re.sub(r"(?i)(https?://[^/@\s]+:)[^@\s]+@", r"\1***@", str(exc))
 
     def _import(self, job, track, attempt):
-        if is_audit_origin(job) and not self.store.artifact_manifest_matches(attempt):
-            self.store.update_job(job["id"], "import_attention", error="audit staged artifact integrity check failed")
+        manifest_required = is_audit_origin(job) or (
+            job["mode"] == "auto" and attempt.get("verdict") != "manual_accepted"
+        )
+        if manifest_required and not self.store.artifact_manifest_matches(attempt):
+            self.store.update_job(job["id"], "import_attention", error="staged artifact integrity check failed")
             return
         local = Path(attempt.get("staged_path") or "")
         if not local.is_file() or local.stat().st_size <= 0:

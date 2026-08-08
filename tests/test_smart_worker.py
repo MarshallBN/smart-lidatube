@@ -108,13 +108,18 @@ def test_youtube_search_and_download_are_injectable(tmp_path):
 def test_worker_rejects_mismatch_then_imports_match(tmp_path):
     store = Store(tmp_path / "smart.db")
     job_id = store.enqueue_job(7, "worker")
+    store.upsert_audit_track(7)
+    store.upsert_quality(7, "current", {"codec": "mp3", "bitrate": 128000, "lossless": False})
 
     class Lidarr:
         def get_track(self, track_id):
-            return {"id": track_id, "title": "Song", "artist": {"artistName": "Artist"}}
+            return {"id": track_id, "trackFileId": 4, "title": "Song", "artist": {"artistName": "Artist"}}
+
+        def get_track_file(self, file_id):
+            return {"id": file_id, "mediaInfo": {"audioCodec": "mp3", "audioBitrate": 128000}}
 
         def track_identity(self, track):
-            return {"recording_id": "expected", "duration": 200, "artist": "Artist", "title": "Song"}
+            return {"recording_id": "expected", "duration": 200, "artist": "Artist", "title": "Song", "track_file_id": 4}
 
         def manual_import(self, path, track):
             self.imported = path
@@ -136,7 +141,8 @@ def test_worker_rejects_mismatch_then_imports_match(tmp_path):
     class Verifier:
         def verify_file(self, path, identity):
             verdict = "rejected" if path.name.startswith("bad") else "accepted"
-            return type("V", (), {"verdict": verdict, "reason": verdict, "evidence": {"file": path.name}})()
+            return type("V", (), {"verdict": verdict, "reason": verdict,
+                "evidence": {"file": path.name, "codec": "aac", "bitrate": 256000}})()
 
     lidarr = Lidarr()
     worker = JobWorker(store, lidarr, Sources(), Verifier(), tmp_path)
@@ -145,6 +151,7 @@ def test_worker_rejects_mismatch_then_imports_match(tmp_path):
     assert store.get_job(job_id)["status"] == "importing"
     assert ".smart-staging" in str(lidarr.imported)
     assert len(store.list_attempts(job_id)) == 2
+    assert store.list_attempts(job_id)[-1]["artifact_manifest"]
 
 
 def test_manual_review_callback_resumes_or_imports(tmp_path):
