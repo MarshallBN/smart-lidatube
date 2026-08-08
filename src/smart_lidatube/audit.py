@@ -73,6 +73,8 @@ class AuditWorker:
 
     def bootstrap_once(self):
         """Read one Lidarr page and add only tracks that already have a file."""
+        if not self.config.enabled or self.store.get_setting("audit_mode", "observe") == "paused":
+            return 0
         enumerate_tracks = getattr(self.lidarr, "list_audit_tracks", None)
         if not enumerate_tracks:
             return 0

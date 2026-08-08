@@ -214,7 +214,82 @@ def test_audit_control_allowlist_persists_and_pause_prevents_checks(tmp_path):
     class Lidarr:
         def get_track(self, _): raise AssertionError("paused must not start a check")
     assert AuditWorker(store, Lidarr(), object(), AuditConfig()).process_once() is None
-    assert client.post("/api/smart/audit/control", json={"mode": "review"}, headers=AUTH).status_code == 202
+    assert client.post("/api/smart/audit/control", json={"mode": "review"}, headers=AUTH).status_code == 400
+
+
+def test_audit_mode_status_and_store_reload_readback(tmp_path):
+    path = tmp_path / "db"
+    store = Store(path)
+    client = create_api(store, "secret").test_client()
+
+    assert client.get("/api/smart/audit/status", headers=AUTH).get_json()["audit"]["mode"] == "observe"
+    assert client.post("/api/smart/audit/control", json={"mode": "observe"}, headers=AUTH).status_code == 202
+    assert Store(path).audit_status()["mode"] == "observe"
+    assert client.post("/api/smart/audit/control", json={"mode": "paused"}, headers=AUTH).status_code == 202
+    assert Store(path).audit_status()["mode"] == "paused"
+    assert create_api(Store(path), "secret").test_client().get(
+        "/api/smart/audit/status", headers=AUTH
+    ).get_json()["audit"]["mode"] == "paused"
+
+
+def test_paused_prevents_bootstrap_but_existing_reviews_remain_actionable(tmp_path):
+    store = Store(tmp_path / "db")
+    store.set_setting("audit_mode", "paused")
+
+    class Lidarr:
+        def list_audit_tracks(self, *_):
+            raise AssertionError("paused must not discover audit tracks")
+
+    assert AuditWorker(store, Lidarr(), object(), AuditConfig()).bootstrap_once() == 0
+    job, attempt = _review(store, audit=True)
+    response = create_api(store, "secret").test_client().post(
+        f"/api/smart/reviews/{attempt}/action", json={"action": "reject"}, headers=AUTH
+    )
+    assert response.status_code == 202
+    assert store.get_job(job)["status"] == "queued"
+
+
+def test_safe_review_dto_has_labels_reason_quality_and_row_actions_without_secrets(tmp_path):
+    store = Store(tmp_path / "db")
+    store.upsert_audit_track(4)
+    store.record_audit_result(4, "suspect", {
+        "artist": "Track Artist", "title": "Track Title", "reason": "recording_mismatch",
+        "codec": "mp3", "bitrate": 128000,
+    })
+    job = store.enqueue_job(
+        4, "audit-review-dto", mode="manual",
+        metadata={"audit_remediation": {"reason": "recording_mismatch", "secret": "https://private"}},
+    )
+    attempt = store.add_attempt(job, "slskd", "private-source", {
+        "artist": "Candidate Artist", "title": "Candidate Title", "album": "Candidate Album",
+        "codec": "flac", "bitrate": 900000, "url": "https://secret", "path": "/private/file",
+    })
+    store.update_attempt(attempt, verdict="awaiting_review", evidence={
+        "reason": "recording_match", "codec": "flac", "bitrate": 900000,
+        "url": "https://secret", "path": "/private/file",
+    })
+    store.update_job(job, "awaiting_review")
+
+    item = create_api(store, "secret").test_client().get(
+        "/api/smart/reviews", headers=AUTH
+    ).get_json()["items"][0]
+
+    assert item["track_label"] == "Track Artist - Track Title"
+    assert item["candidate_label"] == "Candidate Artist - Candidate Title"
+    assert item["reason"] == "recording_match"
+    assert item["quality"] == {"codec": "flac", "bitrate": 900000}
+    assert item["valid_actions"] == ["reject", "ignore_track", "audit_later"]
+    assert item["accept_enabled"] is False
+    assert not any(secret in str(item) for secret in ("https://", "/private", "private-source"))
+
+
+def test_non_audit_review_actions_exclude_audit_later_and_allow_accept(tmp_path):
+    store = Store(tmp_path / "db")
+    _review(store)
+    item = create_api(store, "secret").test_client().get(
+        "/api/smart/reviews", headers=AUTH
+    ).get_json()["items"][0]
+    assert item["valid_actions"] == ["accept", "reject", "cancel"]
 
 
 def test_control_page_has_operational_sections_actions_and_keeps_token_only_in_memory(tmp_path):
@@ -223,8 +298,9 @@ def test_control_page_has_operational_sections_actions_and_keeps_token_only_in_m
         assert section in html
     for action in ("accept", "reject", "cancel", "ignore_track", "audit_later"):
         assert action in html
-    for mode in ("observe", "review", "paused"):
+    for mode in ("observe", "paused"):
         assert mode in html
+    assert "controlAudit('review')" not in html
     assert "auto_safe" not in html
     assert "localStorage" not in html and "sessionStorage" not in html
     assert "let token" in html and "SMART_API_TOKEN" not in html

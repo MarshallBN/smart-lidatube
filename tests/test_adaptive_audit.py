@@ -174,3 +174,15 @@ def test_user_job_preempts_audit_even_when_audit_has_tokens(tmp_path):
     worker = AuditWorker(store, Lidarr(), object(), AuditConfig(), clock=lambda: datetime.now(timezone.utc))
     assert worker.process_once() is None
     assert store.get_audit_track(1)["check_count"] == 0
+
+
+def test_remediation_dispatch_never_creates_audit_work_in_supported_modes(tmp_path):
+    from smart_lidatube.remediation import RemediationDispatcher
+
+    store = Store(tmp_path / "db")
+    store.enqueue_remediation(7, "recording_mismatch")
+    dispatcher = RemediationDispatcher(store, budget_per_hour=1, max_token_bank=1)
+    for mode in ("observe", "paused"):
+        store.set_setting("audit_mode", mode)
+        assert dispatcher.dispatch_once() is None
+        assert store.list_jobs_for_track(7) == []

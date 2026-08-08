@@ -179,10 +179,10 @@ def build_components():
     store.set_setting("audit_budget_per_hour", audit_config.max_per_hour)
     persisted_mode = store.get_setting("audit_mode")
     configured_mode = env("SMART_AUDIT_MODE", "observe")
-    store.set_setting("audit_mode", persisted_mode if persisted_mode in {"observe", "review", "paused"}
-                      else configured_mode if configured_mode in {"observe", "review", "paused"} else "observe")
+    store.set_setting("audit_mode", persisted_mode if persisted_mode in {"observe", "paused"}
+                      else configured_mode if configured_mode in {"observe", "paused"} else "observe")
     store.set_setting("app_version", env("SMART_VERSION", "source"))
-    candidate_budget = int(env("SMART_AUDIT_CANDIDATE_SEARCH_BUDGET_PER_HOUR", "0"))
+    candidate_budget = 0
     store.set_setting("candidate_discovery_budget_per_hour", candidate_budget)
     audit = AuditWorker(
         store,
@@ -226,9 +226,7 @@ def run_forever():
             if not worker.store.audit_work_pending():
                 audit.bootstrap_once()
                 audit.process_once()  # only runs after retry/import work yields idle
-                # Candidate discovery is disabled by default and merely queues
-                # the existing manual, staged-and-verified review workflow.
-                worker.remediation_dispatcher.dispatch_once()
+
             if telegram:
                 timezone = ZoneInfo(env("SMART_AUDIT_TIMEZONE", "UTC"))
                 now = datetime.now(timezone)

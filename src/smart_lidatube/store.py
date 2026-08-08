@@ -496,7 +496,7 @@ class Store:
     def list_safe_reviews(self, cursor, limit):
         updated_at, cursor_id = self._decode_review_cursor(cursor)
         with self._connect() as c:
-            rows = c.execute("""SELECT a.id,j.id job_id,j.lidarr_track_id,j.mode,j.metadata,a.provider,a.provenance,
+            rows = c.execute("""SELECT a.id,j.id job_id,j.lidarr_track_id,j.mode,j.metadata,a.provider,a.provenance,a.evidence,
                 a.created_at,a.updated_at, CASE WHEN """ + AUDIT_ORIGIN_SQL + """ THEN 1 ELSE 0 END audit_origin
                 FROM source_attempts a JOIN retry_jobs j ON j.id=a.job_id
                 WHERE a.verdict='awaiting_review' AND j.status='awaiting_review'
@@ -508,12 +508,23 @@ class Store:
             "sample_rate", "bit_depth", "size_band", "duration",
         }
         for row in rows:
+            provenance = json.loads(row["provenance"] or "{}")
+            evidence = json.loads(row["evidence"] or "{}")
+            track = self.get_audit_track(row["lidarr_track_id"])
+            track_evidence = (track or {}).get("evidence_json", {})
+            audit_origin = bool(row["audit_origin"])
             item = {"attempt_id": row["id"], "job_id": f"job:{row['job_id']}",
                     "track_id": f"track:{row['lidarr_track_id']}", "mode": row["mode"],
                     "provider": row["provider"], "accept_enabled": row["provider"] != "slskd",
-                    "audit_origin": bool(row["audit_origin"]), "created_at": row["created_at"]}
+                    "audit_origin": audit_origin, "created_at": row["created_at"],
+                    "track_label": self._review_label(track_evidence),
+                    "candidate_label": self._review_label(provenance),
+                    "reason": evidence.get("reason") if isinstance(evidence.get("reason"), str) else None,
+                    "quality": {key: evidence[key] for key in ("codec", "bitrate", "sample_rate", "bit_depth")
+                                if isinstance(evidence.get(key), (str, int, float, bool))},
+                    "valid_actions": (["reject", "ignore_track", "audit_later"] if audit_origin
+                                      else ["accept", "reject", "cancel"])}
             if row["provider"] == "slskd":
-                provenance = json.loads(row["provenance"])
                 item["candidate"] = {
                     key: value for key, value in provenance.items()
                     if key in safe_candidate_fields
@@ -521,6 +532,11 @@ class Store:
             items.append(item)
         next_cursor = self._review_cursor(rows[-1]["updated_at"], rows[-1]["id"]) if rows else cursor
         return items, next_cursor
+    @staticmethod
+    def _review_label(facts):
+        artist = facts.get("artist") if isinstance(facts, dict) else None
+        title = facts.get("title") if isinstance(facts, dict) else None
+        return " - ".join(part for part in (artist, title) if isinstance(part, str) and part) or None
     def set_audit_bootstrap_state(self, status, error, count, cursor):
         """Persist only bounded, public-safe bootstrap diagnostics."""
         status = status if status in {"ok", "partial", "failed"} else "failed"
@@ -602,14 +618,7 @@ class Store:
             c.execute("UPDATE library_audit_tracks SET status=?,last_checked_at=CURRENT_TIMESTAMP,next_check_at=?,check_count=check_count+1,last_file_marker=COALESCE(?,last_file_marker),evidence_json=?,last_error_code=?,updated_at=CURRENT_TIMESTAMP WHERE lidarr_track_id=?",(status,next_check_at,marker,json.dumps(safe),error_code,track_id))
             if previous != status:
                 c.execute("INSERT INTO library_audit_events(lidarr_track_id,event_type,result_status,evidence_json,audit_local_day) VALUES(?,?,?,?,?)",(track_id,"classification_change",status,json.dumps(safe),audit_local_day))
-            reason_map = {
-                ("suspect", "recording_mismatch"): "recording_mismatch",
-                ("unavailable", "target_file_missing"): "missing_or_corrupt",
-            }
-            reason = reason_map.get((status, safe.get("reason")))
-            exempt = c.execute("SELECT do_not_upgrade FROM library_audit_tracks WHERE lidarr_track_id=?", (track_id,)).fetchone()["do_not_upgrade"]
-            if reason and not exempt:
-                c.execute("INSERT OR IGNORE INTO remediation_queue(lidarr_track_id,reason) VALUES(?,?)", (track_id, reason))
+
     def enqueue_remediation(self, track_id, reason):
         """Queue only an explicitly requested or high-confidence audit repair."""
         allowed = {"missing_or_corrupt", "recording_mismatch", "explicit_request", "approved_upgrade"}
@@ -669,7 +678,8 @@ class Store:
             try: return kind(self.get_setting(key, str(default)))
             except (TypeError, ValueError): return default
         eta_raw = self.get_setting("audit_eta_hours")
-        return {"checked_total":checked,"eligible_total":eligible,"total":total,
+        return {"mode": self.get_setting("audit_mode", "observe") if self.get_setting("audit_mode", "observe") in {"observe", "paused"} else "observe",
+                "checked_total":checked,"eligible_total":eligible,"total":total,
                 "backlog":numeric("audit_backlog", eligible),
                 "tier_rate_per_hour":numeric("audit_tier_rate_per_hour", 12),
                 "effective_rate_per_hour":numeric("audit_effective_rate_per_hour", 12),

@@ -300,30 +300,48 @@ def test_remediation_queue_only_accepts_high_confidence_or_explicit_requests_and
     assert {key: claimed[key] for key in ("lidarr_track_id", "reason")} == {"lidarr_track_id": 2, "reason": "missing_or_corrupt"}
 
 
-def test_budgeted_remediation_dispatch_creates_manual_job_and_yields_to_normal_work(tmp_path):
+def test_remediation_dispatch_does_not_create_audit_jobs(tmp_path):
     from smart_lidatube.remediation import RemediationDispatcher
 
     store = Store(tmp_path / "audit.db")
     store.enqueue_remediation(4, "recording_mismatch")
     dispatcher = RemediationDispatcher(store, budget_per_hour=1, max_token_bank=1)
-    assert dispatcher.dispatch_once() is not None
-    jobs = store.list_jobs_for_track(4)
-    assert len(jobs) == 1 and jobs[0]["mode"] == "manual"
-    assert jobs[0]["metadata"] == {"audit_remediation": {"reason": "recording_mismatch"}}
+    assert dispatcher.dispatch_once() is None
+    assert store.list_jobs_for_track(4) == []
 
     store.enqueue_remediation(5, "missing_or_corrupt")
     store.enqueue_job(99, "normal-user-work")
     assert dispatcher.dispatch_once() is None
 
 
-def test_high_confidence_audit_result_enqueues_remediation_but_exemption_defers_it(tmp_path):
+def test_high_confidence_audit_result_only_classifies_and_exemption_remains_safe(tmp_path):
     store = Store(tmp_path / "audit.db")
     store.record_audit_result(7, "suspect", {"reason": "recording_mismatch"})
-    claimed = store.claim_remediation()
-    assert {key: claimed[key] for key in ("lidarr_track_id", "reason")} == {"lidarr_track_id": 7, "reason": "recording_mismatch"}
+    assert store.claim_remediation() is None
 
     store.set_audit_exemption(8, do_not_upgrade=True)
     store.record_audit_result(8, "unavailable", {"reason": "target_file_missing"})
+    assert store.claim_remediation() is None
+
+
+def test_observe_classifies_without_creating_audit_remediation(tmp_path):
+    store = Store(tmp_path / "observe.db")
+    store.set_setting("audit_mode", "observe")
+    store.upsert_audit_track(7)
+
+    store.record_audit_result(7, "suspect", {"reason": "recording_mismatch"})
+
+    assert store.get_audit_track(7)["status"] == "suspect"
+    assert store.claim_remediation() is None
+
+
+def test_invalid_legacy_review_mode_still_classifies_without_creating_audit_remediation(tmp_path):
+    store = Store(tmp_path / "legacy.db")
+    store.set_setting("audit_mode", "review")
+    store.upsert_audit_track(7)
+
+    store.record_audit_result(7, "suspect", {"reason": "recording_mismatch"})
+
     assert store.claim_remediation() is None
 
 
@@ -343,7 +361,7 @@ def test_token_is_not_consumed_until_a_candidate_exists(tmp_path):
     assert store.get_setting("audit_tokens") is None
 
 
-def test_remediation_claim_reserves_before_token_and_persists_job_mapping(tmp_path):
+def test_remediation_claim_is_not_consumed_or_mapped_to_a_job(tmp_path):
     from smart_lidatube.remediation import RemediationDispatcher
 
     store = Store(tmp_path / "audit.db")
@@ -354,10 +372,9 @@ def test_remediation_claim_reserves_before_token_and_persists_job_mapping(tmp_pa
     queue_id = store.enqueue_remediation(7, "recording_mismatch")
     job_id = dispatcher.dispatch_once()
     queue = store.get_remediation(queue_id)
-    assert job_id == queue["job_id"]
-    assert queue["status"] == "queued"
-    store.update_job(job_id, "awaiting_review")
-    assert store.get_remediation(queue_id)["status"] == "awaiting_review"
+    assert job_id is None
+    assert queue["job_id"] is None
+    assert queue["status"] == "eligible"
 
 
 def test_remediation_claim_is_released_when_no_search_token(tmp_path):

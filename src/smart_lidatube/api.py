@@ -130,8 +130,8 @@ def register_api(app, store, token, source_health=None):
     @auth
     def audit_control():
         mode = (request.get_json(silent=True) or {}).get("mode")
-        if mode not in {"observe", "review", "paused"}:
-            return jsonify(error="mode must be observe, review, or paused"), 400
+        if mode not in {"observe", "paused"}:
+            return jsonify(error="mode must be observe or paused"), 400
         store.set_setting("audit_mode", mode)
         store.record_event("api", "info", "mode_changed", "audit_mode", {"mode": mode})
         return jsonify(mode=mode), 202
@@ -196,7 +196,7 @@ def register_api(app, store, token, source_health=None):
 <section><h2>Dashboard</h2><pre id=dashboard></pre></section><section><h2>Quality</h2><pre id=quality></pre></section>
 <section><h2>Reviews</h2><pre id=reviews></pre><h3>Actions</h3><input id=attempt placeholder='Attempt ID'><select id=action><option>accept</option><option>reject</option><option>cancel</option><option>ignore_track</option><option>audit_later</option></select><button onclick='reviewAction()'>Apply</button></section>
 <section><h2>Jobs</h2><pre id=jobs></pre><h3>Timing</h3><p>Requested, next attempt, retry count, and 24-hour SLA deadline are shown with each job.</p></section>
-<section><h2>Audit Controls</h2><button onclick=controlAudit('observe')>observe</button><button onclick=controlAudit('review')>review</button><button onclick=controlAudit('paused')>paused</button><pre id=audit></pre></section>
+<section><h2>Audit Controls</h2><button onclick=controlAudit('observe')>On</button><button onclick=controlAudit('paused')>Paused</button><pre id=audit></pre></section>
 <section><h2>Events</h2><pre id=events></pre></section><section><h2>Playlist Integration</h2><p>Coming soon: register and monitor playlist sources. No download action is enabled here.</p></section><script>
 let token = ''; const headers=()=>({Authorization:'Bearer '+token,'Content-Type':'application/json'});
 async function load(name,path){let r=await fetch(path,{headers:headers()});document.getElementById(name).textContent=JSON.stringify(await r.json(),null,2)}

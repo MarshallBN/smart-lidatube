@@ -207,7 +207,7 @@ def test_build_components_retains_three_item_public_return(monkeypatch, tmp_path
 def test_runner_wires_quality_probe_and_safe_control_flags(monkeypatch, tmp_path):
     monkeypatch.setenv("SMART_DB_PATH", str(tmp_path / "db"))
     monkeypatch.setenv("SMART_VERSION", "milestone-a")
-    monkeypatch.setenv("SMART_AUDIT_MODE", "review")
+    monkeypatch.setenv("SMART_AUDIT_MODE", "observe")
     monkeypatch.setenv("SMART_FFPROBE_TIMEOUT", "4")
     monkeypatch.setenv("SMART_AUDIT_CANDIDATE_SEARCH_BUDGET_PER_HOUR", "0")
     monkeypatch.setenv("SMART_AUDIT_MAX_PER_HOUR", "240")
@@ -216,7 +216,7 @@ def test_runner_wires_quality_probe_and_safe_control_flags(monkeypatch, tmp_path
     assert worker.audit_worker.config.max_per_hour == 240
     assert worker.audit_worker.probe.timeout == 4
     assert worker.store.get_setting("app_version") == "milestone-a"
-    assert worker.store.get_setting("audit_mode") == "review"
+    assert worker.store.get_setting("audit_mode") == "observe"
     assert worker.store.get_setting("candidate_discovery_budget_per_hour") == "0"
 
 
