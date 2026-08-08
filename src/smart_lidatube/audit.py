@@ -91,6 +91,7 @@ class AuditWorker:
                 (target or {}).get("path", ""), self.lidarr_music_root, self.audit_music_root
             )
             if path is None or not path.is_file():
+                self.store.invalidate_quality(track_id)
                 self._save(track_id,"unavailable",{"reason":"target_file_missing","artist":identity.get("artist", ""),"title":identity.get("title", "")},count=row["check_count"]); return track_id
             marker=f"{path.stat().st_size}:{int(path.stat().st_mtime)}"
             result=self.verifier.verify_file(path,identity); status=classify_verification(result)

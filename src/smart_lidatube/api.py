@@ -95,11 +95,15 @@ def register_api(app, store, token):
     @app.get("/api/smart/reviews")
     @auth
     def reviews():
-        values = pagination()
-        if not values:
-            return jsonify(error="cursor must be non-negative and limit must be 1-200"), 400
-        cursor, limit = values; items = store.list_safe_reviews(cursor, limit)
-        return jsonify(items=items, next_cursor=items[-1]["attempt_id"] if items else cursor)
+        cursor = request.args.get("cursor", "")
+        try:
+            limit = int(request.args.get("limit", 50))
+            if not 1 <= limit <= 200:
+                raise ValueError
+            items, next_cursor = store.list_safe_reviews(cursor, limit)
+        except (TypeError, ValueError):
+            return jsonify(error="cursor must be opaque and limit must be 1-200"), 400
+        return jsonify(items=items, next_cursor=next_cursor)
 
     @app.post("/api/smart/reviews/<int:attempt_id>/action")
     @auth
@@ -107,9 +111,7 @@ def register_api(app, store, token):
         action = (request.get_json(silent=True) or {}).get("action")
         if action not in {"accept", "reject", "cancel", "ignore_track", "audit_later"}:
             return jsonify(error="invalid review action"), 400
-        reviews = store.list_safe_reviews(max(0, attempt_id-1), 1)
-        audit_origin = reviews and reviews[0]["attempt_id"] == attempt_id and reviews[0]["audit_origin"]
-        if audit_origin:
+        if store.review_is_audit_origin(attempt_id):
             result = store.apply_audit_review(attempt_id, action, {"api_review": True})
         elif action in {"accept", "reject", "cancel"}:
             result = store.apply_review(attempt_id, action, {"api_review": True})

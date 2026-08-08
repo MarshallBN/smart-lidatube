@@ -157,6 +157,28 @@ def test_missing_file_and_exception_never_persist_raw_error_or_side_effects(tmp_
     assert str(tmp_path) not in str(row["evidence_json"])
 
 
+def test_missing_audit_file_invalidates_stale_quality_before_summary(tmp_path):
+    class Lidarr:
+        def get_track(self, track_id):
+            return {"id": track_id, "trackFileId": 2, "title": "Song", "artist": {"artistName": "Artist"}}
+        def get_track_file(self, file_id):
+            return {"id": file_id, "path": str(tmp_path / "missing.flac")}
+        @staticmethod
+        def track_identity(track):
+            return {"artist": "Artist", "title": "Song", "track_file_id": 2}
+
+    store = Store(tmp_path / "audit.db")
+    store.upsert_audit_track(1)
+    store.upsert_quality(1, "old-file", {"codec": "flac", "lossless": True})
+
+    assert AuditWorker(store, Lidarr(), object(), AuditConfig()).process_once() == 1
+
+    assert store.get_quality(1) is None
+    summary = store.quality_summary()
+    assert (summary["measured"], summary["unknown"]) == (0, 1)
+    assert summary["formats"] == {"denominator": 0, "buckets": []}
+
+
 def test_daily_digest_dedupe_pagination_and_sanitization(tmp_path):
     from smart_lidatube.telegram import TelegramBot
     store = Store(tmp_path / "audit.db")
@@ -287,7 +309,7 @@ def test_budgeted_remediation_dispatch_creates_manual_job_and_yields_to_normal_w
     assert dispatcher.dispatch_once() is not None
     jobs = store.list_jobs_for_track(4)
     assert len(jobs) == 1 and jobs[0]["mode"] == "manual"
-    assert jobs[0]["metadata"] == {"audit_remediation": "recording_mismatch"}
+    assert jobs[0]["metadata"] == {"audit_remediation": {"reason": "recording_mismatch"}}
 
     store.enqueue_remediation(5, "missing_or_corrupt")
     store.enqueue_job(99, "normal-user-work")

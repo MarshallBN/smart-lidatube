@@ -46,7 +46,7 @@ def test_audit_review_api_actions_are_authenticated_and_reversible(tmp_path):
 def _awaiting_audit_attempt(store, track_id=1, provider="youtube", source_id="candidate"):
     job = store.enqueue_job(
         track_id, f"audit-{track_id}-{source_id}", mode="manual",
-        metadata={"audit_remediation": "recording_mismatch"},
+        metadata={"audit_remediation": {"reason": "recording_mismatch"}},
     )
     attempt = store.add_attempt(job, provider, source_id)
     store.update_attempt(attempt, verdict="awaiting_review")

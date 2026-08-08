@@ -65,7 +65,7 @@ def test_events_are_allowlisted_safe_and_cursor_limit_bounded(tmp_path):
 
 
 def _review(store, audit=False):
-    metadata = {"audit_remediation": "recording_mismatch"} if audit else None
+    metadata = {"audit_remediation": {"reason": "recording_mismatch"}} if audit else None
     job = store.enqueue_job(4, "review" + str(audit), mode="manual", metadata=metadata)
     attempt = store.add_attempt(job, "youtube", "private-source")
     store.update_attempt(attempt, verdict="awaiting_review", evidence={"raw": "/secret"}, staged_path="/staged/private")
@@ -85,6 +85,52 @@ def test_safe_paginated_jobs_reviews_and_one_shot_candidate_action(tmp_path):
     response = client.post(f"/api/smart/reviews/{attempt}/action", json={"action": "accept"}, headers=AUTH)
     assert response.status_code == 202 and store.get_job(job)["status"] == "ready_import"
     assert client.post(f"/api/smart/reviews/{attempt}/action", json={"action": "reject"}, headers=AUTH).status_code == 409
+
+
+def test_review_cursor_follows_updated_state_not_attempt_id(tmp_path):
+    store = Store(tmp_path / "db")
+    older_job = store.enqueue_job(1, "older", mode="manual")
+    older = store.add_attempt(older_job, "youtube", "older-source")
+    newer_job, newer = _review(store)
+    client = create_api(store, "secret").test_client()
+
+    first = client.get("/api/smart/reviews?limit=1", headers=AUTH).get_json()
+    assert [item["attempt_id"] for item in first["items"]] == [newer]
+
+    store.update_attempt(older, verdict="awaiting_review")
+    store.update_job(older_job, "awaiting_review")
+    second = client.get(
+        f"/api/smart/reviews?limit=1&cursor={first['next_cursor']}", headers=AUTH
+    ).get_json()
+    assert [item["attempt_id"] for item in second["items"]] == [older]
+
+
+def test_audit_origin_requires_true_or_object_marker_for_all_review_routes(tmp_path):
+    store = Store(tmp_path / "db")
+    false_job = store.enqueue_job(1, "false-audit", mode="manual", metadata={"audit_remediation": False})
+    false_attempt = store.add_attempt(false_job, "youtube", "false-source")
+    store.update_attempt(false_attempt, verdict="awaiting_review")
+    store.update_job(false_job, "awaiting_review")
+    true_job = store.enqueue_job(2, "true-audit", mode="manual", metadata={"audit_remediation": True})
+    true_attempt = store.add_attempt(true_job, "youtube", "true-source")
+    store.update_attempt(true_attempt, verdict="awaiting_review")
+    store.update_job(true_job, "awaiting_review")
+    object_job = store.enqueue_job(3, "object-audit", mode="manual", metadata={"audit_remediation": {"reason": "mismatch"}})
+    object_attempt = store.add_attempt(object_job, "youtube", "object-source")
+    store.update_attempt(object_attempt, verdict="awaiting_review")
+    store.update_job(object_job, "awaiting_review")
+    client = create_api(store, "secret").test_client()
+
+    listed = {item["attempt_id"]: item["audit_origin"] for item in
+              client.get("/api/smart/reviews", headers=AUTH).get_json()["items"]}
+    assert listed == {false_attempt: False, true_attempt: True, object_attempt: True}
+    assert client.post(f"/api/smart/audit/attempts/{false_attempt}/review",
+                       json={"action": "accept"}, headers=AUTH).status_code == 409
+    assert client.post(f"/api/smart/reviews/{false_attempt}/action",
+                       json={"action": "accept"}, headers=AUTH).status_code == 202
+    assert store.get_job(false_job)["status"] == "ready_import"
+    assert client.post(f"/api/smart/reviews/{object_attempt}/action",
+                       json={"action": "ignore_track"}, headers=AUTH).status_code == 202
 
 
 def test_individual_job_endpoint_is_safe_too(tmp_path):

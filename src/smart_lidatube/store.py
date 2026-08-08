@@ -2,9 +2,14 @@
 import json
 import sqlite3
 import hashlib
+import base64
+import binascii
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+
+
+AUDIT_ORIGIN_SQL = "(json_type(j.metadata, '$.audit_remediation') = 'true' OR json_type(j.metadata, '$.audit_remediation') = 'object')"
 
 
 class Store:
@@ -236,7 +241,7 @@ class Store:
         return [self._decode(r,("provenance","evidence","artifact_manifest")) for r in rows]
 
     def update_attempt(self,attempt_id,verdict=None,evidence=None,staged_path=None):
-        fields=["updated_at=CURRENT_TIMESTAMP"]; vals=[]
+        fields=["updated_at=strftime('%Y-%m-%d %H:%M:%f','now')"]; vals=[]
         for name,value in (("verdict",verdict),("evidence",json.dumps(evidence) if evidence is not None else None),("staged_path",str(staged_path) if staged_path is not None else None)):
             if value is not None:fields.append(f"{name}=?");vals.append(value)
         with self._connect() as c:c.execute(f"UPDATE source_attempts SET {','.join(fields)} WHERE id=?",(*vals,attempt_id))
@@ -288,7 +293,7 @@ class Store:
             row=c.execute("""SELECT a.job_id,j.lidarr_track_id,a.provider,a.source_id
                 FROM source_attempts a JOIN retry_jobs j ON j.id=a.job_id
                 WHERE a.id=? AND a.verdict='awaiting_review' AND j.status='awaiting_review'
-                AND json_extract(j.metadata, '$.audit_remediation') IS NOT NULL""",(attempt_id,)).fetchone()
+                AND """ + AUDIT_ORIGIN_SQL,(attempt_id,)).fetchone()
             if not row:
                 return None
             verdict, status = outcomes[action]
@@ -330,6 +335,9 @@ class Store:
                 channels=excluded.channels,lossless=excluded.lossless,duration=excluded.duration,
                 size_band=excluded.size_band,source=excluded.source,confidence=excluded.confidence,
                 measured_at=CURRENT_TIMESTAMP""", (track_id, file_marker, *values))
+    def invalidate_quality(self, track_id):
+        with self._connect() as c:
+            c.execute("DELETE FROM quality_inventory WHERE lidarr_track_id=?", (track_id,))
     def get_quality(self, track_id):
         with self._connect() as c:
             row = c.execute("SELECT * FROM quality_inventory WHERE lidarr_track_id=?", (track_id,)).fetchone()
@@ -418,15 +426,42 @@ class Store:
         return ({"id": f"job:{row['id']}", "track_id": f"track:{row['lidarr_track_id']}",
                  "mode": row["mode"], "status": row["status"], "retry_count": row["retry_count"],
                  "created_at": row["created_at"], "updated_at": row["updated_at"]} if row else None)
-    def list_safe_reviews(self, cursor, limit):
+    @staticmethod
+    def _review_cursor(updated_at, attempt_id):
+        raw = json.dumps([updated_at, attempt_id], separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    @staticmethod
+    def _decode_review_cursor(cursor):
+        if not cursor:
+            return "", 0
+        try:
+            raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+            updated_at, attempt_id = json.loads(raw)
+            if not isinstance(updated_at, str) or not isinstance(attempt_id, int) or attempt_id < 0:
+                raise ValueError
+            return updated_at, attempt_id
+        except (ValueError, TypeError, json.JSONDecodeError, binascii.Error):
+            raise ValueError("invalid review cursor") from None
+    def review_is_audit_origin(self, attempt_id):
         with self._connect() as c:
-            rows = c.execute("""SELECT a.id,j.id job_id,j.lidarr_track_id,j.mode,j.metadata,a.created_at
+            return c.execute("""SELECT 1 FROM source_attempts a JOIN retry_jobs j ON j.id=a.job_id
+                WHERE a.id=? AND a.verdict='awaiting_review' AND j.status='awaiting_review' AND """
+                + AUDIT_ORIGIN_SQL, (attempt_id,)).fetchone() is not None
+    def list_safe_reviews(self, cursor, limit):
+        updated_at, cursor_id = self._decode_review_cursor(cursor)
+        with self._connect() as c:
+            rows = c.execute("""SELECT a.id,j.id job_id,j.lidarr_track_id,j.mode,j.metadata,a.created_at,a.updated_at,
+                CASE WHEN """ + AUDIT_ORIGIN_SQL + """ THEN 1 ELSE 0 END audit_origin
                 FROM source_attempts a JOIN retry_jobs j ON j.id=a.job_id
-                WHERE a.verdict='awaiting_review' AND a.id>? ORDER BY a.id LIMIT ?""", (cursor, limit)).fetchall()
-        return [{"attempt_id": row["id"], "job_id": f"job:{row['job_id']}",
+                WHERE a.verdict='awaiting_review' AND j.status='awaiting_review'
+                AND (a.updated_at>? OR (a.updated_at=? AND a.id>?))
+                ORDER BY a.updated_at,a.id LIMIT ?""", (updated_at, updated_at, cursor_id, limit)).fetchall()
+        items = [{"attempt_id": row["id"], "job_id": f"job:{row['job_id']}",
                  "track_id": f"track:{row['lidarr_track_id']}", "mode": row["mode"],
-                 "audit_origin": bool(json.loads(row["metadata"] or "{}").get("audit_remediation")),
+                 "audit_origin": bool(row["audit_origin"]),
                  "created_at": row["created_at"]} for row in rows]
+        next_cursor = self._review_cursor(rows[-1]["updated_at"], rows[-1]["id"]) if rows else cursor
+        return items, next_cursor
     def set_audit_bootstrap_state(self, status, error, count, cursor):
         """Persist only bounded, public-safe bootstrap diagnostics."""
         status = status if status in {"ok", "partial", "failed"} else "failed"

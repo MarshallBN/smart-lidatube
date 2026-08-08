@@ -41,6 +41,6 @@ class RemediationDispatcher:
         job_id = self.store.create_remediation_job(
             item,
             f"audit-remediation:{item['lidarr_track_id']}:{uuid4()}",
-            {"audit_remediation": item["reason"]},
+            {"audit_remediation": {"reason": item["reason"]}},
         )
         return job_id

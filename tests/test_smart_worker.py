@@ -169,7 +169,7 @@ def test_manual_review_callback_resumes_or_imports(tmp_path):
 
 def test_audit_origin_rejects_verified_lossless_current_file_before_review(tmp_path):
     store = Store(tmp_path / "smart.db")
-    job = store.enqueue_job(1, "audit-lossless", mode="manual", metadata={"audit_remediation": "recording_mismatch"})
+    job = store.enqueue_job(1, "audit-lossless", mode="manual", metadata={"audit_remediation": {"reason": "recording_mismatch"}})
     sent = []
 
     class Lidarr:
@@ -192,7 +192,7 @@ def test_audit_origin_rejects_verified_lossless_current_file_before_review(tmp_p
 
 def test_audit_origin_rejects_known_edition_mismatch_and_never_auto_import(tmp_path):
     store = Store(tmp_path / "smart.db")
-    job = store.enqueue_job(1, "audit-edition", metadata={"audit_remediation": "recording_mismatch"})
+    job = store.enqueue_job(1, "audit-edition", metadata={"audit_remediation": {"reason": "recording_mismatch"}})
 
     class Lidarr:
         def get_track(self, track_id): return {"id": track_id, "trackFileId": 4, "title": "Song", "artist": {"artistName": "Artist"}}
@@ -213,7 +213,7 @@ def test_audit_origin_rejects_known_edition_mismatch_and_never_auto_import(tmp_p
 
 def test_audit_origin_sends_verified_recording_match_without_edition_evidence_to_review(tmp_path):
     store = Store(tmp_path / "smart.db")
-    job = store.enqueue_job(1, "audit-recording-match", metadata={"audit_remediation": "recording_mismatch"})
+    job = store.enqueue_job(1, "audit-recording-match", metadata={"audit_remediation": {"reason": "recording_mismatch"}})
     sent = []
 
     class Lidarr:
@@ -236,7 +236,7 @@ def test_audit_origin_sends_verified_recording_match_without_edition_evidence_to
 
 def test_audit_origin_without_telegram_is_reviewable_through_api_after_verified_staging(tmp_path):
     store = Store(tmp_path / "smart.db")
-    job = store.enqueue_job(1, "audit-api-review", metadata={"audit_remediation": "recording_mismatch"})
+    job = store.enqueue_job(1, "audit-api-review", metadata={"audit_remediation": {"reason": "recording_mismatch"}})
 
     class Lidarr:
         def get_track(self, track_id): return {"id": track_id, "trackFileId": 4, "title": "Song", "artist": {"artistName": "Artist"}}
@@ -287,7 +287,7 @@ def test_non_audit_job_without_telegram_remains_review_unavailable(tmp_path):
 
 def test_audit_review_actions_are_distinct_one_shot_and_safe(tmp_path):
     store = Store(tmp_path / "smart.db")
-    job = store.enqueue_job(1, "audit-review", mode="manual", metadata={"audit_remediation": "recording_mismatch"})
+    job = store.enqueue_job(1, "audit-review", mode="manual", metadata={"audit_remediation": {"reason": "recording_mismatch"}})
     attempt = store.add_attempt(job, "youtube", "abc")
     store.update_attempt(attempt, verdict="awaiting_review", staged_path="/staged/a")
     store.update_job(job, "awaiting_review")
@@ -306,7 +306,7 @@ def test_audit_import_rejects_staged_artifact_drift(tmp_path):
     store = Store(tmp_path / "smart.db")
     staged = tmp_path / ".smart-staging" / "1" / "candidate"
     staged.parent.mkdir(parents=True); staged.write_bytes(b"verified")
-    job = store.enqueue_job(1, "audit-drift", mode="manual", metadata={"audit_remediation": "recording_mismatch"})
+    job = store.enqueue_job(1, "audit-drift", mode="manual", metadata={"audit_remediation": {"reason": "recording_mismatch"}})
     attempt = store.add_attempt(job, "youtube", "abc")
     store.update_attempt(attempt, verdict="manual_accepted", staged_path=staged)
     store.capture_artifact_manifest(attempt, staged)
