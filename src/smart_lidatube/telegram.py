@@ -3,6 +3,7 @@
 import requests
 
 from .audit_origin import is_audit_origin
+from .review_policy import review_action_error
 
 
 class TelegramBot:
@@ -124,6 +125,14 @@ class TelegramBot:
         attempt = self.store.get_attempt(attempt_id)
         job = self.store.get_job(attempt["job_id"]) if attempt else None
         audit = is_audit_origin(job)
+        policy_error = review_action_error(
+            self.store.review_provider(attempt_id), action
+        )
+        if policy_error:
+            self.request("answerCallbackQuery", {
+                "callback_query_id": query["id"], "text": policy_error,
+            })
+            return False
         if audit:
             if action not in ("accept", "reject", "ignore_track", "audit_later"):
                 return False

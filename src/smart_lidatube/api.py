@@ -5,6 +5,8 @@ from uuid import uuid4
 
 from flask import Flask, Response, jsonify, request
 
+from .review_policy import review_action_error
+
 
 VALID_MODES = {"auto", "manual"}
 SAFE_AUDIT_REQUEUE_STATUSES = {"unavailable", "unverifiable"}
@@ -111,8 +113,9 @@ def register_api(app, store, token, source_health=None):
         action = (request.get_json(silent=True) or {}).get("action")
         if action not in {"accept", "reject", "cancel", "ignore_track", "audit_later"}:
             return jsonify(error="invalid review action"), 400
-        if action == "accept" and store.review_provider(attempt_id) == "slskd":
-            return jsonify(error="slskd acquisition is not enabled"), 409
+        policy_error = review_action_error(store.review_provider(attempt_id), action)
+        if policy_error:
+            return jsonify(error=policy_error), 409
         if store.review_is_audit_origin(attempt_id):
             result = store.apply_audit_review(attempt_id, action, {"api_review": True})
         elif action in {"accept", "reject", "cancel"}:

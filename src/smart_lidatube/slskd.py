@@ -269,7 +269,8 @@ class SlskdDiscoveryClient:
             )
             if not _same_origin(response, self.base, url):
                 raise ValueError("response origin changed")
-            response.raise_for_status()
+            if not 200 <= response.status_code < 300:
+                raise ValueError("non-success health response")
             return {"state": "available", "error": None}
         except Exception:
             return {"state": "unavailable", "error": "slskd_unavailable"}

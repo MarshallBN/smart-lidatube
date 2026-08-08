@@ -1,6 +1,7 @@
 from smart_lidatube.api import create_api
 from smart_lidatube.slskd import ReviewGatedDiscoverySources, SoularrLidarrConflictGuard
 from smart_lidatube.store import Store
+from smart_lidatube.telegram import TelegramBot
 from smart_lidatube.worker import JobWorker
 from smart_lidatube.runner import build_discovery_source
 
@@ -134,6 +135,31 @@ def test_slskd_review_cannot_be_accepted_for_acquisition_but_can_be_rejected(tmp
     assert client.post(f"/api/smart/reviews/{attempt}/action", json={"action": "reject"}, headers=AUTH).status_code == 202
 
 
+def test_telegram_cannot_accept_slskd_metadata_review_and_leaves_it_awaiting(tmp_path):
+    store = Store(tmp_path / "db")
+    job = store.enqueue_job(7, "manual", mode="manual")
+    attempt = store.add_attempt(job, "slskd", "slskd:opaque", {"provider": "slskd"})
+    store.update_attempt(attempt, verdict="awaiting_review")
+    store.update_job(job, "awaiting_review")
+    sent = []
+    bot = TelegramBot(
+        "token", store, allowed_users={5}, allowed_chats={9},
+        request=lambda method, payload: sent.append((method, payload)) or {},
+    )
+
+    accepted = bot.handle_callback({
+        "id": "callback", "from": {"id": 5}, "message": {"chat": {"id": 9}},
+        "data": f"attempt:{attempt}:accept",
+    })
+
+    assert accepted is False
+    assert sent == [("answerCallbackQuery", {
+        "callback_query_id": "callback", "text": "slskd acquisition is not enabled",
+    })]
+    assert store.get_attempt(attempt)["verdict"] == "awaiting_review"
+    assert store.get_job(job)["status"] == "awaiting_review"
+
+
 def test_authenticated_status_aggregates_safe_source_health(tmp_path):
     class Health:
         def health(self):
@@ -178,7 +204,7 @@ def test_runtime_status_provider_checks_configured_slskd_safely():
               "SMART_SOULARR_COEXISTENCE_MODE": "manual-retry-only"}
     class Session:
         def get(self, url, **kwargs):
-            return type("R", (), {"url": url, "raise_for_status": lambda self: None})()
+            return type("R", (), {"url": url, "status_code": 200})()
     status = build_source_status(values.get, session=Session()).health()
     assert status["slskd"] == {"state": "available", "error": None}
 

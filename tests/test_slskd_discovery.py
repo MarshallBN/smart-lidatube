@@ -107,6 +107,32 @@ def test_slskd_rejects_redirect_final_origin_without_leaking_key():
     assert client.health() == {"state": "unavailable", "error": "slskd_unavailable"}
 
 
+@pytest.mark.parametrize("status", [300, 301, 302, 307, 308])
+def test_slskd_health_rejects_every_redirect_status_even_on_same_origin(status):
+    calls = []
+
+    class Session:
+        def get(self, url, **kwargs):
+            calls.append(kwargs)
+            return Response({}, status=status, url=url)
+
+    client = SlskdDiscoveryClient("http://slskd:5030", "secret", session=Session())
+    assert client.health() == {"state": "unavailable", "error": "slskd_unavailable"}
+    assert calls == [{
+        "headers": {"X-API-Key": "secret"}, "timeout": (2, 5), "allow_redirects": False,
+    }]
+
+
+@pytest.mark.parametrize("status", [200, 204, 299])
+def test_slskd_health_accepts_explicit_same_origin_2xx(status):
+    class Session:
+        def get(self, url, **kwargs):
+            return Response({}, status=status, url=url)
+
+    client = SlskdDiscoveryClient("http://slskd:5030", "secret", session=Session())
+    assert client.health() == {"state": "available", "error": None}
+
+
 def test_slskd_errors_are_sanitized_and_health_is_safe():
     leaked = "http://admin:secret@192.168.50.166:5030/private/path?token=secret"
 
