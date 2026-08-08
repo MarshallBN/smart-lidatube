@@ -189,6 +189,71 @@ def test_retry_api_validates_mode_and_supports_optional_idempotency(tmp_path):
     assert fresh != first
 
 
+def test_audit_requeue_api_requires_auth_and_only_makes_safe_statuses_due(tmp_path):
+    store = Store(tmp_path / "audit.db")
+    for track_id, status, checked_at in (
+        (1, "unavailable", "2025-01-03 00:00:00"),
+        (2, "unverifiable", "2025-01-01 00:00:00"),
+        (3, "verified", "2025-01-02 00:00:00"),
+        (4, "unavailable", "2025-01-04 00:00:00"),
+    ):
+        store.upsert_audit_track(track_id)
+        store.record_audit_result(track_id, status, {"reason": "target_file_missing"}, "2099-01-01 00:00:00")
+        store.set_audit_last_checked(track_id, checked_at)
+    store.set_audit_exemption(4, do_not_audit=True)
+    job = store.enqueue_job(99, "existing-retry")
+    before = store.get_audit_track(1).copy()
+    client = create_api(store, "secret").test_client()
+
+    assert client.post("/api/smart/audit/requeue").status_code == 401
+    response = client.post(
+        "/api/smart/audit/requeue", json={"limit": 1},
+        headers={"Authorization": "Bearer secret"},
+    )
+
+    assert response.status_code == 202
+    assert response.get_json() == {"requeued": 1}
+    assert store.get_audit_track(2)["next_check_at"] is None  # oldest matching track wins
+    assert store.get_audit_track(1)["next_check_at"] == "2099-01-01 00:00:00"
+    assert store.get_audit_track(3)["next_check_at"] == "2099-01-01 00:00:00"
+    assert store.get_audit_track(4)["next_check_at"] == "2099-01-01 00:00:00"
+    assert store.get_audit_track(1) == before
+    assert store.get_job(job)["status"] == "queued"
+
+
+def test_audit_requeue_api_accepts_only_safe_statuses(tmp_path):
+    store = Store(tmp_path / "audit.db")
+    store.upsert_audit_track(1)
+    store.record_audit_result(1, "unavailable", {}, "2099-01-01 00:00:00")
+    client = create_api(store, "secret").test_client()
+    headers = {"Authorization": "Bearer secret"}
+
+    invalid = client.post("/api/smart/audit/requeue", json={"statuses": ["verified"]}, headers=headers)
+    too_many = client.post("/api/smart/audit/requeue", json={"limit": 201}, headers=headers)
+
+    assert invalid.status_code == 400
+    assert too_many.status_code == 400
+    assert store.get_audit_track(1)["next_check_at"] == "2099-01-01 00:00:00"
+
+
+def test_audit_requeue_api_can_target_one_safe_status_without_mutating_audit_data(tmp_path):
+    store = Store(tmp_path / "audit.db")
+    for track_id, status in ((1, "unavailable"), (2, "unverifiable")):
+        store.upsert_audit_track(track_id)
+        store.record_audit_result(track_id, status, {"reason": "target_file_missing"}, "2099-01-01 00:00:00")
+    untouched = store.get_audit_track(1).copy()
+    client = create_api(store, "secret").test_client()
+
+    response = client.post(
+        "/api/smart/audit/requeue", json={"statuses": ["unverifiable"], "limit": 2},
+        headers={"Authorization": "Bearer secret"},
+    )
+
+    assert response.get_json() == {"requeued": 1}
+    assert store.get_audit_track(2)["next_check_at"] is None
+    assert store.get_audit_track(1) == untouched
+
+
 def test_retry_import_api_only_recovers_prepared_import_without_submission(tmp_path):
     store = Store(tmp_path / "x.db")
     client = create_api(store, "secret").test_client()

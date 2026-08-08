@@ -337,6 +337,23 @@ class Store:
     def set_audit_last_checked(self,track_id,value):
         self.upsert_audit_track(track_id)
         with self._connect() as c:c.execute("UPDATE library_audit_tracks SET last_checked_at=? WHERE lidarr_track_id=?",(value,track_id))
+    def requeue_audits(self, statuses, limit):
+        """Make a bounded set of non-exempt audit rows due without other side effects."""
+        placeholders = ",".join("?" for _ in statuses)
+        with self._connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            rows = c.execute(
+                "SELECT lidarr_track_id FROM library_audit_tracks "
+                f"WHERE do_not_audit=0 AND status IN ({placeholders}) "
+                "ORDER BY last_checked_at ASC, lidarr_track_id ASC LIMIT ?",
+                (*statuses, limit),
+            ).fetchall()
+            if rows:
+                c.executemany(
+                    "UPDATE library_audit_tracks SET next_check_at=NULL WHERE lidarr_track_id=?",
+                    ((row["lidarr_track_id"],) for row in rows),
+                )
+            return len(rows)
     def list_eligible_audits(self):
         with self._connect() as c:rows=c.execute("SELECT * FROM library_audit_tracks WHERE do_not_audit=0 AND (next_check_at IS NULL OR next_check_at<=CURRENT_TIMESTAMP) ORDER BY priority_score DESC,lidarr_track_id").fetchall()
         return [self._decode(row,("evidence_json",)) for row in rows]

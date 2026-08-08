@@ -7,6 +7,8 @@ from flask import Flask, jsonify, request
 
 
 VALID_MODES = {"auto", "manual"}
+SAFE_AUDIT_REQUEUE_STATUSES = {"unavailable", "unverifiable"}
+MAX_AUDIT_REQUEUE_LIMIT = 200
 
 
 def register_api(app, store, token):
@@ -56,6 +58,24 @@ def register_api(app, store, token):
     @auth
     def audit_status():
         return jsonify(audit=store.audit_status())
+
+    @app.post("/api/smart/audit/requeue")
+    @auth
+    def requeue_audits():
+        body = request.get_json(silent=True) or {}
+        statuses = body.get("statuses", sorted(SAFE_AUDIT_REQUEUE_STATUSES))
+        limit = body.get("limit", MAX_AUDIT_REQUEUE_LIMIT)
+        if (
+            not isinstance(statuses, list)
+            or not statuses
+            or any(not isinstance(status, str) for status in statuses)
+            or not set(statuses).issubset(SAFE_AUDIT_REQUEUE_STATUSES)
+            or not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= MAX_AUDIT_REQUEUE_LIMIT
+        ):
+            return jsonify(error="statuses must be unavailable/unverifiable and limit must be 1-200"), 400
+        return jsonify(requeued=store.requeue_audits(sorted(set(statuses)), limit)), 202
 
     @app.post("/api/smart/audit/attempts/<int:attempt_id>/review")
     @auth
