@@ -27,7 +27,7 @@ class JobWorker:
     def __init__(
         self, store, lidarr, sources, verifier, downloads_root, telegram=None,
         review_chat_id=None, lidarr_downloads_root=None, lease_seconds=300,
-        retry_delay=30, max_attempts=5, import_verify_interval=10,
+        retry_delay=30, max_attempts=5, auto_max_attempts=None, import_verify_interval=10,
         import_verify_timeout=900, candidate_probe=None,
     ):
         self.store = store
@@ -41,6 +41,7 @@ class JobWorker:
         self.lease_seconds = lease_seconds
         self.retry_delay = retry_delay
         self.max_attempts = max_attempts
+        self.auto_max_attempts = auto_max_attempts
         self.import_verify_interval = import_verify_interval
         self.import_verify_timeout = import_verify_timeout
         self.candidate_probe = candidate_probe
@@ -55,7 +56,8 @@ class JobWorker:
             # Never retry the whole job after the durable pre-POST barrier.
             if self.store.get_job(job["id"])["status"] == "processing":
                 self.store.schedule_retry(
-                    job["id"], str(exc), self.retry_delay, self.max_attempts
+                    job["id"], str(exc), self.retry_delay,
+                    self.auto_max_attempts if job["mode"] == "auto" else self.max_attempts
                 )
         return job["id"]
 
@@ -225,6 +227,7 @@ class JobWorker:
                         job["lidarr_track_id"], candidate["provider"],
                         candidate["source_id"], attempt_id,
                     )
+                    self._cleanup_rejected(staged, attempt_id)
                     continue
             self.store.update_attempt(
                 attempt_id, verdict=verification.verdict,
@@ -254,6 +257,7 @@ class JobWorker:
                                               evidence={"reason": "auto_quality_policy"}, staged_path=staged)
                     self.store.reject(job["lidarr_track_id"], candidate["provider"],
                                       candidate["source_id"], attempt_id)
+                    self._cleanup_rejected(staged, attempt_id)
                     continue
             if verification.verdict == "accepted" and (audit_origin or job["mode"] == "auto"):
                 self.store.capture_artifact_manifest(attempt_id, staged)
@@ -264,9 +268,21 @@ class JobWorker:
             return
         if job["mode"] == "auto":
             self.store.schedule_retry(job["id"], "no_policy_approved_candidate",
-                                      self.retry_delay, self.max_attempts)
+                                      self.retry_delay, self.auto_max_attempts)
         else:
             self.store.update_job(job["id"], "exhausted", error="no candidates remain")
+
+    def _cleanup_rejected(self, staged, attempt_id):
+        """Delete only regular artifacts contained by this worker's staging root."""
+        staging_root = (self.downloads_root / ".smart-staging").resolve()
+        try:
+            artifact = Path(staged).resolve(strict=True)
+            artifact.relative_to(staging_root)
+            if artifact.is_file():
+                artifact.unlink()
+                self.store.clear_attempt_staged_path(attempt_id)
+        except (OSError, ValueError):
+            return
 
     def _current_quality(self, identity, track_id):
         """Use Lidarr's track-file facts only; never infer quality from its path."""

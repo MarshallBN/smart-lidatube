@@ -142,7 +142,7 @@ class Store:
         with self._connect() as c:
             row=c.execute("SELECT retry_count,mode,sla_deadline FROM retry_jobs WHERE id=?",(job_id,)).fetchone(); count=row[0]+1
             expired = bool(row["sla_deadline"] and c.execute("SELECT ?<=CURRENT_TIMESTAMP",(row["sla_deadline"],)).fetchone()[0])
-            terminal = count>=max_attempts or expired
+            terminal = (max_attempts is not None and count>=max_attempts) or expired
             status="operator_attention" if row["mode"]=="auto" and terminal else "failed" if terminal else "queued"
             bounded_delay=min(3600,max(1,int(delay))*(2**max(0,count-1)))
             c.execute("""UPDATE retry_jobs SET status=?,retry_count=?,
@@ -273,6 +273,10 @@ class Store:
         for name,value in (("verdict",verdict),("evidence",json.dumps(evidence) if evidence is not None else None),("staged_path",str(staged_path) if staged_path is not None else None)):
             if value is not None:fields.append(f"{name}=?");vals.append(value)
         with self._connect() as c:c.execute(f"UPDATE source_attempts SET {','.join(fields)} WHERE id=?",(*vals,attempt_id))
+
+    def clear_attempt_staged_path(self, attempt_id):
+        with self._connect() as c:
+            c.execute("UPDATE source_attempts SET staged_path=NULL WHERE id=?", (attempt_id,))
 
     @staticmethod
     def _artifact_manifest(path):

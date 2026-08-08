@@ -21,6 +21,7 @@ def audit_rate_tier(backlog):
 class AuditConfig:
     enabled: bool = True
     budget_per_hour: int = 12
+    max_per_hour: int = 300
     max_token_bank: int = 24
     fairness_share: float = .20
     bootstrap_batch_size: int = 100
@@ -56,7 +57,7 @@ class AuditWorker:
     def refresh_throughput(self):
         backlog = self.store.audit_backlog()
         tier = audit_rate_tier(backlog)
-        effective = min(max(0, self.config.budget_per_hour), tier)
+        effective = min(tier, max(0, self.config.max_per_hour))
         eta = math.ceil(backlog / effective * 100) / 100 if effective else None
         self.store.set_audit_throughput(backlog, tier, effective, eta)
         return effective
@@ -113,6 +114,7 @@ class AuditWorker:
         except Exception:
             self.store.set_setting("audit_backoff_reason", "resource_unavailable")
             return None
+        self.store.set_setting("audit_backoff_reason", "")
         row=self.store.select_audit_candidate(self.config.fairness_share)
         if not row or not self._token(): return None
         track_id=row["lidarr_track_id"]

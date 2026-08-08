@@ -37,6 +37,11 @@ class LidarrClient:
     def get_track_file(self, file_id):
         return self._get(f"trackfile/{file_id}")
 
+    def health_check(self):
+        """Use Lidarr's authenticated, read-only status endpoint."""
+        status = self._get("system/status")
+        return isinstance(status, dict) and bool(status)
+
     def list_audit_tracks(self, cursor="albums:0", limit=100):
         """Read a bounded organized-track slice through supported Lidarr APIs.
 

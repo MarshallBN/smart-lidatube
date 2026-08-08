@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from smart_lidatube.audit import AuditConfig, AuditWorker
 from smart_lidatube.clients import LidarrClient, NavidromeClient, YouTubeClient
 from smart_lidatube.fingerprint import AcoustIDClient, FileVerifier, Fpcalc
+from smart_lidatube.guards import HostResourceGuard
 from smart_lidatube.retry import PlaylistPoller
 from smart_lidatube.remediation import RemediationDispatcher
 from smart_lidatube.quality import FFprobe
@@ -72,6 +73,8 @@ def build_components():
         lease_seconds=int(env("SMART_CLAIM_TIMEOUT", "300")),
         retry_delay=int(env("SMART_RETRY_DELAY", "30")),
         max_attempts=int(env("SMART_MAX_ATTEMPTS", "5")),
+        auto_max_attempts=(int(env("SMART_AUTO_MAX_ATTEMPTS"))
+                           if env("SMART_AUTO_MAX_ATTEMPTS") else None),
         import_verify_interval=float(env("SMART_IMPORT_VERIFY_INTERVAL", "10")),
         import_verify_timeout=float(env("SMART_IMPORT_VERIFY_TIMEOUT", "900")),
         candidate_probe=FFprobe(timeout=float(env("SMART_FFPROBE_TIMEOUT", "10"))),
@@ -89,16 +92,19 @@ def build_components():
             store,
             lidarr.resolve_track_from_navidrome_entry,
         )
+    legacy_audit_budget = env("SMART_AUDIT_VERIFY_BUDGET_PER_HOUR", "")
+    audit_max = env("SMART_AUDIT_MAX_PER_HOUR", legacy_audit_budget or "300")
     audit_config = AuditConfig(
         enabled=env("SMART_AUDIT_ENABLED", "true").lower() == "true",
-        budget_per_hour=int(env("SMART_AUDIT_VERIFY_BUDGET_PER_HOUR", "12")),
+        budget_per_hour=int(legacy_audit_budget or "12"),
+        max_per_hour=int(audit_max),
         max_token_bank=int(env("SMART_AUDIT_MAX_TOKEN_BANK", "24")),
         fairness_share=float(env("SMART_AUDIT_FAIRNESS_SHARE", "0.20")),
         bootstrap_batch_size=int(env("SMART_AUDIT_BOOTSTRAP_BATCH_SIZE", "100")),
         timezone=env("SMART_AUDIT_TIMEZONE", "UTC"),
     )
     store.set_setting("audit_enabled", str(audit_config.enabled).lower())
-    store.set_setting("audit_budget_per_hour", audit_config.budget_per_hour)
+    store.set_setting("audit_budget_per_hour", audit_config.max_per_hour)
     persisted_mode = store.get_setting("audit_mode")
     configured_mode = env("SMART_AUDIT_MODE", "observe")
     store.set_setting("audit_mode", persisted_mode if persisted_mode in {"observe", "review", "paused"}
@@ -114,6 +120,11 @@ def build_components():
         lidarr_music_root=env("LIDARR_MUSIC_ROOT") or None,
         audit_music_root=env("SMART_AUDIT_MUSIC_ROOT") or None,
         probe=FFprobe(timeout=float(env("SMART_FFPROBE_TIMEOUT", "10"))),
+        health_check=lidarr.health_check,
+        resource_check=HostResourceGuard(
+            max_load_per_cpu=float(env("SMART_AUDIT_MAX_LOAD_PER_CPU", "0.75")),
+            max_disk_io_ms=int(env("SMART_AUDIT_MAX_DISK_IO_MS", "250")),
+        ),
     )
     worker.audit_worker = audit
     worker.remediation_dispatcher = RemediationDispatcher(

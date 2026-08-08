@@ -37,6 +37,22 @@ def test_auto_job_has_durable_24h_deadline_and_bounded_exponential_retry(tmp_pat
     assert store.get_job(job_id)["status"] == "operator_attention"
 
 
+def test_auto_retry_attempt_limit_is_independent_and_defaults_to_deadline(tmp_path):
+    store = Store(tmp_path / "db")
+    job_id = store.enqueue_job(1, "auto-window", mode="auto")
+    for _ in range(24):
+        store.update_job(job_id, "processing")
+        store.schedule_retry(job_id, "temporary", delay=3600, max_attempts=None)
+        assert store.get_job(job_id)["status"] == "queued"
+
+
+def test_manual_retry_still_honors_existing_max_attempts(tmp_path):
+    store = Store(tmp_path / "db")
+    job_id = store.enqueue_job(1, "manual-limit", mode="manual")
+    store.schedule_retry(job_id, "temporary", max_attempts=1)
+    assert store.get_job(job_id)["status"] == "failed"
+
+
 def test_migration_backfills_deadline_for_existing_auto_jobs(tmp_path):
     path = tmp_path / "legacy"
     store = Store(path)
@@ -120,6 +136,31 @@ def test_auto_retry_uses_injected_candidate_probe_for_quality_gate(tmp_path):
 
     JobWorker(store, Lidarr(), Sources(), Verifier(), root, candidate_probe=Probe()).process_once()
     assert store.get_job(job_id)["status"] == "importing"
+
+
+def test_policy_rejection_removes_only_contained_staged_artifact(tmp_path):
+    root = tmp_path / "downloads"
+    store = Store(tmp_path / "db")
+    job_id = store.enqueue_job(1, "cleanup", mode="auto")
+    store.upsert_audit_track(1)
+    store.upsert_quality(1, "current", {"codec": "mp3", "bitrate": 128000})
+    outside = tmp_path / "keep"; outside.write_bytes(b"keep")
+    class Lidarr:
+        def get_track(self, track_id): return {"id": track_id, "trackFileId": 4}
+        def get_track_file(self, _): return {"id": 4, "mediaInfo": {"audioCodec": "mp3", "audioBitrate": 128000}}
+        def track_identity(self, _): return {"artist": "A", "title": "T", "track_file_id": 4, "recording_id": "rec"}
+    class Sources:
+        def search(self, *_): return [{"provider": "youtube", "source_id": "x"}]
+        def download(self, _, directory):
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / "x.m4a"; path.write_bytes(b"audio"); return path
+    class Verifier:
+        def verify_file(self, *_): return type("V", (), {"verdict": "accepted", "reason": "match", "evidence": {}})()
+    JobWorker(store, Lidarr(), Sources(), Verifier(), root).process_once()
+    attempt = store.list_attempts(job_id)[0]
+    assert not (root / ".smart-staging" / str(job_id) / "x.m4a").exists()
+    assert outside.exists()
+    assert attempt["staged_path"] is None
 
 
 def test_expired_auto_job_escalates_without_search(tmp_path):

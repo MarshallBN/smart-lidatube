@@ -210,12 +210,22 @@ def test_runner_wires_quality_probe_and_safe_control_flags(monkeypatch, tmp_path
     monkeypatch.setenv("SMART_AUDIT_MODE", "review")
     monkeypatch.setenv("SMART_FFPROBE_TIMEOUT", "4")
     monkeypatch.setenv("SMART_AUDIT_CANDIDATE_SEARCH_BUDGET_PER_HOUR", "0")
+    monkeypatch.setenv("SMART_AUDIT_MAX_PER_HOUR", "240")
     worker, _, _ = build_components()
     assert isinstance(worker.audit_worker.probe, FFprobe)
+    assert worker.audit_worker.config.max_per_hour == 240
     assert worker.audit_worker.probe.timeout == 4
     assert worker.store.get_setting("app_version") == "milestone-a"
     assert worker.store.get_setting("audit_mode") == "review"
     assert worker.store.get_setting("candidate_discovery_budget_per_hour") == "0"
+
+
+def test_legacy_audit_budget_is_used_as_max_when_new_setting_is_absent(monkeypatch, tmp_path):
+    monkeypatch.setenv("SMART_DB_PATH", str(tmp_path / "db"))
+    monkeypatch.delenv("SMART_AUDIT_MAX_PER_HOUR", raising=False)
+    monkeypatch.setenv("SMART_AUDIT_VERIFY_BUDGET_PER_HOUR", "42")
+    worker, _, _ = build_components()
+    assert worker.audit_worker.config.max_per_hour == 42
 
 
 def test_runner_preserves_api_persisted_mode_and_rejects_unsafe_env_default(monkeypatch, tmp_path):

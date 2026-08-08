@@ -3,6 +3,19 @@ import pytest
 from smart_lidatube.clients import LidarrClient, NavidromeClient
 
 
+def test_lidarr_health_probe_uses_safe_read_only_status_call():
+    calls = []
+    class Session:
+        @staticmethod
+        def get(url, **kwargs):
+            calls.append((url, kwargs))
+            return type("Response", (), {"raise_for_status": lambda self: None,
+                                          "json": lambda self: {"version": "2"}})()
+    client = LidarrClient("http://lidarr", "secret", session=Session())
+    assert client.health_check()
+    assert calls[0][0] == "http://lidarr/api/v1/system/status"
+
+
 class Response:
     def __init__(self, data=None, status=200): self._data=data or {}; self.status_code=status
     def json(self): return self._data
