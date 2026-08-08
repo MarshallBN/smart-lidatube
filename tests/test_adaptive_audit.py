@@ -126,6 +126,46 @@ def test_host_resource_guard_fails_closed_on_proc_read_error_without_losing_samp
     assert guard()
 
 
+def test_host_resource_guard_defers_after_device_set_changes_then_uses_new_baseline():
+    files = {
+        "/proc/loadavg": "0.25 0.10 0.05 1/100 1\n",
+        "/proc/diskstats": _diskstats((0, "sda", 100)),
+    }
+    times = iter((1.0, 2.0, 3.0, 4.0))
+    guard = HostResourceGuard(
+        max_load_per_cpu=1.0, max_disk_io_ms=50,
+        read_text=files.__getitem__, monotonic=lambda: next(times),
+        whole_device=lambda _: True,
+    )
+
+    assert not guard()
+    files["/proc/diskstats"] = _diskstats((0, "sda", 110), (1, "sdb", 10))
+    assert not guard()
+    files["/proc/diskstats"] = _diskstats((0, "sda", 120))
+    assert not guard()
+    files["/proc/diskstats"] = _diskstats((0, "sda", 130))
+    assert guard()
+
+
+def test_host_resource_guard_defers_after_any_io_counter_reset_then_uses_new_baseline():
+    files = {
+        "/proc/loadavg": "0.25 0.10 0.05 1/100 1\n",
+        "/proc/diskstats": _diskstats((0, "sda", 100), (1, "sdb", 200)),
+    }
+    times = iter((1.0, 2.0, 3.0))
+    guard = HostResourceGuard(
+        max_load_per_cpu=1.0, max_disk_io_ms=50,
+        read_text=files.__getitem__, monotonic=lambda: next(times),
+        whole_device=lambda _: True,
+    )
+
+    assert not guard()
+    files["/proc/diskstats"] = _diskstats((0, "sda", 110), (1, "sdb", 190))
+    assert not guard()
+    files["/proc/diskstats"] = _diskstats((0, "sda", 120), (1, "sdb", 200))
+    assert guard()
+
+
 def test_user_job_preempts_audit_even_when_audit_has_tokens(tmp_path):
     store = Store(tmp_path / "db"); store.upsert_audit_track(1)
     store.enqueue_job(2, "user-retry", mode="auto")

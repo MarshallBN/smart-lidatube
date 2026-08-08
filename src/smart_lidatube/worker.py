@@ -1,6 +1,8 @@
 """Autonomous targeted replacement job lifecycle."""
+import os
 import re
 import shutil
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -285,13 +287,19 @@ class JobWorker:
 
     def _cleanup_rejected(self, staged, attempt_id):
         """Forget every rejection path; delete only regular contained artifacts."""
-        staging_root = (self.downloads_root / ".smart-staging").resolve()
+        lexical_root = Path(os.path.abspath(self.downloads_root / ".smart-staging"))
         try:
-            artifact = Path(staged).resolve(strict=True)
-            artifact.relative_to(staging_root)
-            if artifact.is_file():
-                artifact.unlink()
-        except (OSError, ValueError):
+            artifact = Path(os.path.abspath(staged))
+            artifact.relative_to(lexical_root)
+            artifact_stat = artifact.lstat()
+            if stat.S_ISLNK(artifact_stat.st_mode):
+                return
+            if not stat.S_ISREG(artifact_stat.st_mode):
+                return
+            resolved_root = lexical_root.resolve(strict=True)
+            artifact.resolve(strict=True).relative_to(resolved_root)
+            artifact.unlink()
+        except (OSError, TypeError, ValueError):
             pass
         finally:
             self.store.clear_attempt_staged_path(attempt_id)

@@ -39,9 +39,13 @@ class HostResourceGuard:
         elapsed = now - prior[0]
         if elapsed <= 0:
             return False
+        if io_ticks.keys() != prior[1].keys():
+            return False
+        if any(ticks < prior[1][name] for name, ticks in io_ticks.items()):
+            return False
         disk_delta = sum(
-            max(0, ticks - prior[1][name])
-            for name, ticks in io_ticks.items() if name in prior[1]
+            ticks - prior[1][name]
+            for name, ticks in io_ticks.items()
         )
         busy_ms_per_second = disk_delta / elapsed
         return (load / cpus <= self.max_load_per_cpu

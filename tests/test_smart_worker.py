@@ -191,6 +191,41 @@ def test_verifier_rejection_clears_unsafe_staged_path_without_deleting_artifact(
     assert store.is_rejected(8, "youtube", "unsafe")
 
 
+def test_rejected_symlink_and_target_remain_untouched_while_state_is_cleared(tmp_path):
+    root = tmp_path / "downloads"
+    staging = root / ".smart-staging" / "1"
+    staging.mkdir(parents=True)
+    target = staging / "target.m4a"
+    target.write_bytes(b"keep")
+    link = staging / "candidate.m4a"
+    link.symlink_to(target)
+    store = Store(tmp_path / "symlink.db")
+    job = store.enqueue_job(1, "symlink", mode="manual")
+    attempt = store.add_attempt(job, "youtube", "candidate")
+    store.update_attempt(attempt, staged_path=link)
+
+    JobWorker(store, object(), object(), object(), root)._cleanup_rejected(link, attempt)
+
+    assert link.is_symlink()
+    assert target.read_bytes() == b"keep"
+    assert store.get_attempt(attempt)["staged_path"] is None
+
+
+def test_rejected_non_regular_staging_entry_remains_while_state_is_cleared(tmp_path):
+    root = tmp_path / "downloads"
+    directory = root / ".smart-staging" / "1" / "candidate"
+    directory.mkdir(parents=True)
+    store = Store(tmp_path / "directory.db")
+    job = store.enqueue_job(1, "directory", mode="manual")
+    attempt = store.add_attempt(job, "youtube", "candidate")
+    store.update_attempt(attempt, staged_path=directory)
+
+    JobWorker(store, object(), object(), object(), root)._cleanup_rejected(directory, attempt)
+
+    assert directory.is_dir()
+    assert store.get_attempt(attempt)["staged_path"] is None
+
+
 def test_manual_review_callback_resumes_or_imports(tmp_path):
     store = Store(tmp_path / "smart.db")
     job = store.enqueue_job(1, "review", mode="manual")
