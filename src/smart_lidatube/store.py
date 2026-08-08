@@ -510,6 +510,7 @@ class Store:
         for row in rows:
             item = {"attempt_id": row["id"], "job_id": f"job:{row['job_id']}",
                     "track_id": f"track:{row['lidarr_track_id']}", "mode": row["mode"],
+                    "provider": row["provider"], "accept_enabled": row["provider"] != "slskd",
                     "audit_origin": bool(row["audit_origin"]), "created_at": row["created_at"]}
             if row["provider"] == "slskd":
                 provenance = json.loads(row["provenance"])
