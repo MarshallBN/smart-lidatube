@@ -37,6 +37,29 @@ def test_auto_job_has_durable_24h_deadline_and_bounded_exponential_retry(tmp_pat
     assert store.get_job(job_id)["status"] == "operator_attention"
 
 
+def test_auto_retry_is_capped_at_sla_deadline_and_claimable_at_deadline(tmp_path):
+    store = Store(tmp_path / "db")
+    job_id = store.enqueue_job(1, "deadline-cap", mode="auto")
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE retry_jobs SET sla_deadline=datetime('now','+10 seconds') WHERE id=?", (job_id,))
+    store.schedule_retry(job_id, "temporary", delay=3600, max_attempts=None)
+    job = store.get_job(job_id)
+    assert job["status"] == "queued"
+    assert job["next_attempt_at"] == job["sla_deadline"]
+
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE retry_jobs SET sla_deadline=CURRENT_TIMESTAMP,next_attempt_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
+    claimed = store.claim_job()
+    assert claimed["id"] == job_id
+
+    class Lidarr:
+        def get_track(self, _): raise AssertionError("deadline must escalate before search")
+
+    store.update_job(job_id, "queued")
+    assert JobWorker(store, Lidarr(), object(), object(), tmp_path).process_once() == job_id
+    assert store.get_job(job_id)["status"] == "operator_attention"
+
+
 def test_auto_retry_attempt_limit_is_independent_and_defaults_to_deadline(tmp_path):
     store = Store(tmp_path / "db")
     job_id = store.enqueue_job(1, "auto-window", mode="auto")

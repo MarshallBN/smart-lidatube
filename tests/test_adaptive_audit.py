@@ -65,21 +65,65 @@ def test_healthy_gate_clears_stale_backoff_before_candidate_selection(tmp_path):
     assert store.get_setting("audit_backoff_reason") == ""
 
 
-def test_host_resource_guard_reads_load_and_disk_io_with_injected_readers():
+def _diskstats(*devices):
+    return "".join(
+        f"8 {minor} {name} 1 0 2 3 4 0 5 6 0 {io_ticks} 8 0 0 0 0 0\n"
+        for minor, name, io_ticks in devices
+    )
+
+
+def test_host_resource_guard_first_sample_defers_and_excludes_partitions():
     files = {
         "/proc/loadavg": "0.25 0.10 0.05 1/100 1\n",
-        "/proc/diskstats": "8 0 sda 1 0 2 3 4 0 5 6 0 7 8 0 0 0 0 0\n",
+        "/proc/diskstats": _diskstats((0, "sda", 100), (1, "sda1", 100)),
     }
-    guard = HostResourceGuard(max_load_per_cpu=1.0, max_disk_io_ms=10,
-                              cpu_count=lambda: 2, read_text=files.__getitem__)
+    times = iter((10.0, 11.0))
+    guard = HostResourceGuard(
+        max_load_per_cpu=1.0, max_disk_io_ms=50, cpu_count=lambda: 2,
+        read_text=files.__getitem__, monotonic=lambda: next(times),
+        whole_device=lambda name: name == "sda",
+    )
+
+    assert not guard()
+    files["/proc/diskstats"] = _diskstats((0, "sda", 120), (1, "sda1", 200))
     assert guard()
-    files["/proc/loadavg"] = "3.0 0.10 0.05 1/100 1\n"
-    assert not guard()
 
 
-def test_host_resource_guard_fails_closed_on_proc_read_error():
-    guard = HostResourceGuard(read_text=lambda _: (_ for _ in ()).throw(OSError()))
+def test_host_resource_guard_normalizes_io_ticks_by_elapsed_time():
+    files = {
+        "/proc/loadavg": "0.25 0.10 0.05 1/100 1\n",
+        "/proc/diskstats": _diskstats((0, "nvme0n1", 100)),
+    }
+    times = iter((1.0, 1.5, 3.5))
+    guard = HostResourceGuard(
+        max_load_per_cpu=1.0, max_disk_io_ms=50, read_text=files.__getitem__,
+        monotonic=lambda: next(times), whole_device=lambda _: True,
+    )
+
     assert not guard()
+    files["/proc/diskstats"] = _diskstats((0, "nvme0n1", 140))
+    assert not guard()  # 40 ms / 0.5 s = 80 ms/s
+    files["/proc/diskstats"] = _diskstats((0, "nvme0n1", 180))
+    assert guard()  # 40 ms / 2 s = 20 ms/s
+
+
+def test_host_resource_guard_fails_closed_on_proc_read_error_without_losing_sample():
+    files = {
+        "/proc/loadavg": "0.25 0.10 0.05 1/100 1\n",
+        "/proc/diskstats": _diskstats((0, "sda", 100)),
+    }
+    times = iter((1.0, 2.0))
+    guard = HostResourceGuard(
+        max_disk_io_ms=50,
+        read_text=lambda path: files[path] if path in files else (_ for _ in ()).throw(OSError()),
+        monotonic=lambda: next(times), whole_device=lambda _: True,
+    )
+    assert not guard()
+    files.pop("/proc/loadavg")
+    assert not guard()
+    files["/proc/loadavg"] = "0.25 0.10 0.05 1/100 1\n"
+    files["/proc/diskstats"] = _diskstats((0, "sda", 120))
+    assert guard()
 
 
 def test_user_job_preempts_audit_even_when_audit_has_tokens(tmp_path):

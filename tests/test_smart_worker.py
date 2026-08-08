@@ -150,8 +150,45 @@ def test_worker_rejects_mismatch_then_imports_match(tmp_path):
     assert store.is_rejected(7, "youtube", "bad")
     assert store.get_job(job_id)["status"] == "importing"
     assert ".smart-staging" in str(lidarr.imported)
-    assert len(store.list_attempts(job_id)) == 2
-    assert store.list_attempts(job_id)[-1]["artifact_manifest"]
+    attempts = store.list_attempts(job_id)
+    assert len(attempts) == 2
+    rejected = attempts[0]
+    assert rejected["verdict"] == "rejected"
+    assert rejected["evidence"] == {
+        "reason": "rejected", "file": "bad.m4a", "codec": "aac", "bitrate": 256000,
+    }
+    assert rejected["staged_path"] is None
+    assert not (tmp_path / ".smart-staging" / str(job_id) / "bad.m4a").exists()
+    assert attempts[-1]["artifact_manifest"]
+
+
+def test_verifier_rejection_clears_unsafe_staged_path_without_deleting_artifact(tmp_path):
+    root = tmp_path / "downloads"
+    outside = tmp_path / "outside.m4a"
+    outside.write_bytes(b"evidence artifact")
+    store = Store(tmp_path / "unsafe.db")
+    job_id = store.enqueue_job(8, "unsafe-rejection", mode="manual")
+
+    class Lidarr:
+        def get_track(self, track_id): return {"id": track_id}
+        def track_identity(self, _): return {"artist": "A", "title": "T"}
+
+    class Sources:
+        def search(self, *_): return [{"provider": "youtube", "source_id": "unsafe"}]
+        def download(self, *_): return outside
+
+    class Verifier:
+        def verify_file(self, *_):
+            return type("V", (), {"verdict": "rejected", "reason": "mismatch",
+                                   "evidence": {"score": 0.1}})()
+
+    JobWorker(store, Lidarr(), Sources(), Verifier(), root).process_once()
+    attempt = store.list_attempts(job_id)[0]
+    assert outside.read_bytes() == b"evidence artifact"
+    assert attempt["staged_path"] is None
+    assert attempt["verdict"] == "rejected"
+    assert attempt["evidence"] == {"reason": "mismatch", "score": 0.1}
+    assert store.is_rejected(8, "youtube", "unsafe")
 
 
 def test_manual_review_callback_resumes_or_imports(tmp_path):

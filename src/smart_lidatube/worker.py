@@ -249,6 +249,7 @@ class JobWorker:
                     job["lidarr_track_id"], candidate["provider"],
                     candidate["source_id"], attempt_id,
                 )
+                self._cleanup_rejected(staged, attempt_id)
                 continue
             if verification.verdict == "accepted" and job["mode"] == "auto" and not audit_origin:
                 candidate_quality = verification.evidence or {}
@@ -283,16 +284,17 @@ class JobWorker:
             self.store.update_job(job["id"], "exhausted", error="no candidates remain")
 
     def _cleanup_rejected(self, staged, attempt_id):
-        """Delete only regular artifacts contained by this worker's staging root."""
+        """Forget every rejection path; delete only regular contained artifacts."""
         staging_root = (self.downloads_root / ".smart-staging").resolve()
         try:
             artifact = Path(staged).resolve(strict=True)
             artifact.relative_to(staging_root)
             if artifact.is_file():
                 artifact.unlink()
-                self.store.clear_attempt_staged_path(attempt_id)
         except (OSError, ValueError):
-            return
+            pass
+        finally:
+            self.store.clear_attempt_staged_path(attempt_id)
 
     def _current_quality(self, identity, track_id):
         """Use Lidarr's track-file facts only; never infer quality from its path."""

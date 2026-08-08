@@ -146,9 +146,13 @@ class Store:
             status="operator_attention" if row["mode"]=="auto" and terminal else "failed" if terminal else "queued"
             bounded_delay=min(3600,max(1,int(delay))*(2**max(0,count-1)))
             c.execute("""UPDATE retry_jobs SET status=?,retry_count=?,
-                next_attempt_at=CASE WHEN ?='queued' THEN datetime('now',?) END,
+                next_attempt_at=CASE WHEN ?='queued' THEN CASE
+                    WHEN mode='auto' AND sla_deadline IS NOT NULL
+                         AND datetime('now',?) > sla_deadline THEN sla_deadline
+                    ELSE datetime('now',?) END END,
                 last_error=?,claim_token=NULL,claimed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                (status,count,status,f"+{bounded_delay} seconds",error,job_id))
+                (status,count,status,f"+{bounded_delay} seconds",
+                 f"+{bounded_delay} seconds",error,job_id))
             c.execute("UPDATE remediation_queue SET status=?,updated_at=CURRENT_TIMESTAMP WHERE job_id=?",(status,job_id))
 
     def prepare_import(self, job_id, prior_file_id, path):
