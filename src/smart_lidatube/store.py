@@ -8,8 +8,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from .audit_origin import AUDIT_ORIGIN_SQL
 
-AUDIT_ORIGIN_SQL = "(json_type(j.metadata, '$.audit_remediation') = 'true' OR json_type(j.metadata, '$.audit_remediation') = 'object')"
+ATTEMPT_UPDATED_AT_SQL = """CASE
+    WHEN COALESCE((SELECT MAX(clock.updated_at) FROM source_attempts AS clock), '')
+         >= strftime('%Y-%m-%d %H:%M:%f','now')
+    THEN strftime('%Y-%m-%d %H:%M:%f', julianday(
+         (SELECT MAX(clock.updated_at) FROM source_attempts AS clock)) + 1.0 / 86400000)
+    ELSE strftime('%Y-%m-%d %H:%M:%f','now') END"""
 
 
 class Store:
@@ -72,6 +78,12 @@ class Store:
             c.execute("""UPDATE source_rejections SET attempt_id=(SELECT MIN(a2.id) FROM source_attempts a1 JOIN source_attempts a2 ON a2.job_id=a1.job_id AND a2.provider=a1.provider AND a2.source_id=a1.source_id WHERE a1.id=source_rejections.attempt_id) WHERE attempt_id IS NOT NULL""")
             c.execute("DELETE FROM source_attempts WHERE id NOT IN (SELECT MIN(id) FROM source_attempts GROUP BY job_id,provider,source_id)")
             c.execute("CREATE UNIQUE INDEX IF NOT EXISTS attempts_job_source ON source_attempts(job_id,provider,source_id)")
+            # Historical remediation jobs stored the reason directly as a truthy string.
+            c.execute("""UPDATE retry_jobs SET metadata=json_set(
+                metadata, '$.audit_remediation',
+                json_object('reason', json_extract(metadata, '$.audit_remediation')))
+                WHERE json_type(metadata, '$.audit_remediation')='text'
+                AND length(json_extract(metadata, '$.audit_remediation')) > 0""")
 
     @staticmethod
     def _add_columns(c,table,columns):
@@ -182,7 +194,7 @@ class Store:
         with self._connect() as c:
             c.execute("BEGIN IMMEDIATE")
             c.execute(
-                "UPDATE source_attempts SET verdict='notification_pending',updated_at=CURRENT_TIMESTAMP WHERE id=? AND job_id=?",
+                f"UPDATE source_attempts SET verdict='notification_pending',updated_at={ATTEMPT_UPDATED_AT_SQL} WHERE id=? AND job_id=?",
                 (attempt_id, job_id),
             )
             c.execute(
@@ -212,7 +224,7 @@ class Store:
             ).rowcount
             if changed:
                 c.execute(
-                    "UPDATE source_attempts SET verdict='awaiting_review',updated_at=CURRENT_TIMESTAMP WHERE id=? AND job_id=? AND verdict='notification_pending'",
+                    f"UPDATE source_attempts SET verdict='awaiting_review',updated_at={ATTEMPT_UPDATED_AT_SQL} WHERE id=? AND job_id=? AND verdict='notification_pending'",
                     (attempt_id, job_id),
                 )
                 c.execute("UPDATE remediation_queue SET status='awaiting_review',updated_at=CURRENT_TIMESTAMP WHERE job_id=?",(job_id,))
@@ -241,7 +253,7 @@ class Store:
         return [self._decode(r,("provenance","evidence","artifact_manifest")) for r in rows]
 
     def update_attempt(self,attempt_id,verdict=None,evidence=None,staged_path=None):
-        fields=["updated_at=strftime('%Y-%m-%d %H:%M:%f','now')"]; vals=[]
+        fields=[f"updated_at={ATTEMPT_UPDATED_AT_SQL}"]; vals=[]
         for name,value in (("verdict",verdict),("evidence",json.dumps(evidence) if evidence is not None else None),("staged_path",str(staged_path) if staged_path is not None else None)):
             if value is not None:fields.append(f"{name}=?");vals.append(value)
         with self._connect() as c:c.execute(f"UPDATE source_attempts SET {','.join(fields)} WHERE id=?",(*vals,attempt_id))
@@ -254,7 +266,7 @@ class Store:
     def capture_artifact_manifest(self, attempt_id, path):
         manifest=self._artifact_manifest(path)
         with self._connect() as c:
-            c.execute("UPDATE source_attempts SET artifact_manifest=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(json.dumps(manifest),attempt_id))
+            c.execute(f"UPDATE source_attempts SET artifact_manifest=?,updated_at={ATTEMPT_UPDATED_AT_SQL} WHERE id=?",(json.dumps(manifest),attempt_id))
         return manifest
 
     def artifact_manifest_matches(self, attempt):
@@ -274,7 +286,7 @@ class Store:
             c.execute("BEGIN IMMEDIATE")
             row=c.execute("SELECT a.job_id,j.lidarr_track_id,a.provider,a.source_id FROM source_attempts a JOIN retry_jobs j ON j.id=a.job_id WHERE a.id=? AND a.verdict='awaiting_review' AND j.status='awaiting_review'",(attempt_id,)).fetchone()
             if not row:return None
-            c.execute("UPDATE source_attempts SET verdict=?,evidence=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(verdicts[action],json.dumps(evidence),attempt_id)); c.execute("UPDATE retry_jobs SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(statuses[action],row["job_id"]))
+            c.execute(f"UPDATE source_attempts SET verdict=?,evidence=?,updated_at={ATTEMPT_UPDATED_AT_SQL} WHERE id=?",(verdicts[action],json.dumps(evidence),attempt_id)); c.execute("UPDATE retry_jobs SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(statuses[action],row["job_id"]))
             if action=="reject":c.execute("INSERT OR IGNORE INTO source_rejections VALUES(?,?,?,?,CURRENT_TIMESTAMP)",(row["lidarr_track_id"],row["provider"],row["source_id"],attempt_id))
             return row["job_id"]
 
@@ -297,7 +309,7 @@ class Store:
             if not row:
                 return None
             verdict, status = outcomes[action]
-            c.execute("UPDATE source_attempts SET verdict=?,evidence=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(verdict,json.dumps(evidence),attempt_id))
+            c.execute(f"UPDATE source_attempts SET verdict=?,evidence=?,updated_at={ATTEMPT_UPDATED_AT_SQL} WHERE id=?",(verdict,json.dumps(evidence),attempt_id))
             c.execute("UPDATE retry_jobs SET status=?,claim_token=NULL,claimed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",(status,row["job_id"]))
             c.execute("UPDATE remediation_queue SET status=?,updated_at=CURRENT_TIMESTAMP WHERE job_id=?",(status,row["job_id"]))
             if action == "reject":

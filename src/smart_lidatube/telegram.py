@@ -2,6 +2,8 @@
 
 import requests
 
+from .audit_origin import is_audit_origin
+
 
 class TelegramBot:
     def __init__(
@@ -36,7 +38,7 @@ class TelegramBot:
             return False
         attempt = self.store.get_attempt(attempt_id)
         job = self.store.get_job(attempt["job_id"]) if attempt else None
-        audit = bool(job and job.get("metadata", {}).get("audit_remediation"))
+        audit = is_audit_origin(job)
         keyboard = ([
             [
                 {"text": "Accept replacement", "callback_data": f"attempt:{attempt_id}:accept"},
@@ -121,7 +123,7 @@ class TelegramBot:
         evidence = {"telegram_user_id": user, "telegram_chat_id": chat}
         attempt = self.store.get_attempt(attempt_id)
         job = self.store.get_job(attempt["job_id"]) if attempt else None
-        audit = bool(job and job.get("metadata", {}).get("audit_remediation"))
+        audit = is_audit_origin(job)
         if audit:
             if action not in ("accept", "reject", "ignore_track", "audit_later"):
                 return False

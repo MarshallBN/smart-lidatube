@@ -3,6 +3,7 @@ import time
 
 from smart_lidatube.api import create_api
 from smart_lidatube.audit import AuditConfig, AuditWorker
+from smart_lidatube.audit_origin import is_audit_origin
 from smart_lidatube.store import Store
 
 
@@ -105,6 +106,31 @@ def test_review_cursor_follows_updated_state_not_attempt_id(tmp_path):
     assert [item["attempt_id"] for item in second["items"]] == [older]
 
 
+def test_review_cursor_sees_notification_transition_after_fractional_cursor_in_same_second(tmp_path):
+    store = Store(tmp_path / "db")
+    first_job, first_attempt = _review(store)
+    second_job = store.enqueue_job(5, "notification-transition", mode="manual")
+    second_attempt = store.add_attempt(second_job, "youtube", "second-source")
+    store.prepare_notification(second_job, second_attempt, 9, "review", {})
+    client = create_api(store, "secret").test_client()
+
+    while time.time() % 1 > 0.1:
+        time.sleep(0.005)
+    with sqlite3.connect(store.path) as db:
+        db.execute(
+            "UPDATE source_attempts SET updated_at=strftime('%Y-%m-%d %H:%M:%S','now') || '.999' WHERE id=?",
+            (first_attempt,),
+        )
+    first = client.get("/api/smart/reviews?limit=1", headers=AUTH).get_json()
+    assert [item["attempt_id"] for item in first["items"]] == [first_attempt]
+
+    assert store.notification_delivered(second_job, second_attempt)
+    second = client.get(
+        f"/api/smart/reviews?limit=1&cursor={first['next_cursor']}", headers=AUTH
+    ).get_json()
+    assert [item["attempt_id"] for item in second["items"]] == [second_attempt]
+
+
 def test_audit_origin_requires_true_or_object_marker_for_all_review_routes(tmp_path):
     store = Store(tmp_path / "db")
     false_job = store.enqueue_job(1, "false-audit", mode="manual", metadata={"audit_remediation": False})
@@ -131,6 +157,43 @@ def test_audit_origin_requires_true_or_object_marker_for_all_review_routes(tmp_p
     assert store.get_job(false_job)["status"] == "ready_import"
     assert client.post(f"/api/smart/reviews/{object_attempt}/action",
                        json={"action": "ignore_track"}, headers=AUTH).status_code == 202
+
+
+def test_legacy_string_audit_marker_migrates_to_object_and_stays_reviewable(tmp_path):
+    path = tmp_path / "legacy.db"
+    store = Store(path)
+    legacy_job = store.enqueue_job(1, "legacy-audit", mode="manual")
+    legacy_attempt = store.add_attempt(legacy_job, "youtube", "legacy-source")
+    false_job = store.enqueue_job(2, "false-audit", mode="manual")
+    false_attempt = store.add_attempt(false_job, "youtube", "false-source")
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "UPDATE retry_jobs SET metadata=? WHERE id=?",
+            ('{"audit_remediation":"recording_mismatch"}', legacy_job),
+        )
+        db.execute(
+            "UPDATE retry_jobs SET metadata=? WHERE id=?",
+            ('{"audit_remediation":false}', false_job),
+        )
+        db.execute("UPDATE retry_jobs SET status='awaiting_review' WHERE id IN (?,?)", (legacy_job, false_job))
+        db.execute("UPDATE source_attempts SET verdict='awaiting_review' WHERE id IN (?,?)", (legacy_attempt, false_attempt))
+
+    migrated = Store(path)
+    assert migrated.get_job(legacy_job)["metadata"]["audit_remediation"] == {
+        "reason": "recording_mismatch"
+    }
+    assert migrated.get_job(false_job)["metadata"]["audit_remediation"] is False
+    assert is_audit_origin(migrated.get_job(legacy_job))
+    assert not is_audit_origin(migrated.get_job(false_job))
+
+    client = create_api(migrated, "secret").test_client()
+    listed = {item["attempt_id"]: item["audit_origin"] for item in
+              client.get("/api/smart/reviews", headers=AUTH).get_json()["items"]}
+    assert listed == {legacy_attempt: True, false_attempt: False}
+    assert client.post(f"/api/smart/reviews/{legacy_attempt}/action",
+                       json={"action": "audit_later"}, headers=AUTH).status_code == 202
+    assert client.post(f"/api/smart/audit/attempts/{false_attempt}/review",
+                       json={"action": "accept"}, headers=AUTH).status_code == 409
 
 
 def test_individual_job_endpoint_is_safe_too(tmp_path):

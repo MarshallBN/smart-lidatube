@@ -4,6 +4,7 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
+from smart_lidatube.audit_origin import is_audit_origin
 from smart_lidatube.retry import filter_candidates
 from smart_lidatube.quality import quality_decision
 
@@ -177,7 +178,7 @@ class JobWorker:
                 identity["current_track_file"] = self.lidarr.get_track_file(file_id)
             except Exception as exc:
                 identity["current_track_file_error"] = str(exc)
-        audit_origin = bool(job.get("metadata", {}).get("audit_remediation"))
+        audit_origin = is_audit_origin(job)
         current_quality = self._current_quality(identity, job["lidarr_track_id"])
         candidates = filter_candidates(
             self.store, job["lidarr_track_id"],
@@ -263,7 +264,7 @@ class JobWorker:
 
     def _request_review(self, job, attempt_id, candidate, verification):
         if not self.telegram or self.review_chat_id is None:
-            if job.get("metadata", {}).get("audit_remediation"):
+            if is_audit_origin(job):
                 self.store.update_attempt(attempt_id, verdict="awaiting_review")
                 self.store.update_job(job["id"], "awaiting_review")
                 return
@@ -294,7 +295,7 @@ class JobWorker:
         return re.sub(r"(?i)(https?://[^/@\s]+:)[^@\s]+@", r"\1***@", str(exc))
 
     def _import(self, job, track, attempt):
-        if job.get("metadata", {}).get("audit_remediation") and not self.store.artifact_manifest_matches(attempt):
+        if is_audit_origin(job) and not self.store.artifact_manifest_matches(attempt):
             self.store.update_job(job["id"], "import_attention", error="audit staged artifact integrity check failed")
             return
         local = Path(attempt.get("staged_path") or "")
