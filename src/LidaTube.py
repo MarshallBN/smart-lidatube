@@ -10,6 +10,7 @@ from ytmusicapi import YTMusic
 from flask import Flask, render_template
 from flask_socketio import SocketIO
 from smart_lidatube.api import register_api
+from smart_lidatube.runner import build_source_status
 from smart_lidatube.store import Store
 import yt_dlp
 import concurrent.futures
@@ -777,7 +778,8 @@ class DataHandler:
 app = Flask(__name__)
 app.secret_key = "secret_key"
 smart_store = Store(os.environ.get("SMART_DB_PATH", "/lidatube/config/smart-lidatube.db"))
-register_api(app, smart_store, os.environ.get("SMART_API_TOKEN", ""))
+register_api(app, smart_store, os.environ.get("SMART_API_TOKEN", ""),
+             source_health=build_source_status())
 socketio = SocketIO(app)
 data_handler = DataHandler()
 

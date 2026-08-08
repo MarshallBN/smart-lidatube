@@ -23,6 +23,20 @@ class Response:
         if self.status_code >= 400: raise RuntimeError(self.status_code)
 
 
+def test_lidarr_queue_records_uses_supported_bounded_queue_api():
+    calls = []
+    class Session:
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return Response({"records": [{"trackId": 7}], "totalRecords": 1})
+    records = LidarrClient("http://lidarr", "key", session=Session()).queue_records()
+    assert records == [{"trackId": 7}]
+    assert calls == [("http://lidarr/api/v1/queue", {
+        "headers": {"X-Api-Key": "key"},
+        "params": {"page": 1, "pageSize": 250}, "timeout": 30,
+    })]
+
+
 def test_lidarr_manual_import_submits_direct_command_without_discovery():
     sibling_candidate = {
         "path": "/stage/godzilla.m4a", "trackIds": [242162],

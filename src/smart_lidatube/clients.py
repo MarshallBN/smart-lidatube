@@ -42,6 +42,10 @@ class LidarrClient:
         status = self._get("system/status")
         return isinstance(status, dict) and bool(status)
 
+    def queue_records(self):
+        """Read Lidarr's supported queue endpoint with the bounded pager."""
+        return self._paginated("queue")
+
     def list_audit_tracks(self, cursor="albums:0", limit=100):
         """Read a bounded organized-track slice through supported Lidarr APIs.
 

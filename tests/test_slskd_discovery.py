@@ -7,13 +7,16 @@ from smart_lidatube.slskd import (
     SlskdDiscoveryError,
     SourceConflict,
     SoularrLidarrConflictGuard,
+    LocalSoularrStateAdapter,
+    ProductionConflictStateProvider,
 )
 
 
 class Response:
-    def __init__(self, data=None, status=200):
+    def __init__(self, data=None, status=200, url=None):
         self.data = data
         self.status_code = status
+        self.url = url
 
     def json(self):
         return self.data
@@ -62,11 +65,46 @@ def test_slskd_search_returns_only_bounded_safe_metadata_and_uses_timeouts():
     assert len(results[0]["source_id"]) == len("slskd:") + 32
     serialized = str(results)
     assert not any(secret in serialized for secret in ("private-peer", "10.2.3.4", "Artist\\\\Album", "runtime-secret"))
-    assert calls[0] == ("post", "http://192.168.50.166:5030/api/v0/searches", {
-        "json": {"searchText": "Artist - Song Album"},
-        "headers": {"X-API-Key": "runtime-secret"}, "timeout": (1.5, 4),
-    })
+    assert calls[0][0:2] == ("post", "http://192.168.50.166:5030/api/v0/searches")
+    assert calls[0][2]["headers"] == {"X-API-Key": "runtime-secret"}
+    assert calls[0][2]["timeout"] == (1.5, 4)
     assert calls[1][2]["timeout"] == (1.5, 4)
+    assert calls[0][2]["json"] == {
+        "searchText": "Artist - Song Album", "responseLimit": 1,
+        "fileLimit": 1, "minimumResponseFileCount": 1,
+    }
+    assert calls[0][2]["allow_redirects"] is False
+    assert calls[1][2]["params"] == {"includeResponses": "true"}
+    assert calls[1][2]["allow_redirects"] is False
+
+
+def test_source_id_is_stable_across_search_ids_and_normalizes_identity():
+    client = SlskdDiscoveryClient("http://slskd:5030", "key", opaque_key="opaque")
+    first = {"id": "one", "responses": [{"username": " Peer ", "files": [
+        {"filename": r"Music\Artist\Song.FLAC", "size": 42}]}]}
+    second = {"id": "two", "responses": [{"username": "peer", "files": [
+        {"filename": "music/artist/song.flac", "size": "42"}]}]}
+    one = client._safe_results(first, "A", "T", None, 1)[0]["source_id"]
+    two = client._safe_results(second, "A", "T", None, 1)[0]["source_id"]
+    assert one == two
+    assert all(value not in one for value in ("peer", "song", "42"))
+
+
+@pytest.mark.parametrize("url", [
+    "ftp://slskd", "http://user:pass@slskd", "http://slskd/path",
+    "http://slskd?key=x", "http://slskd#fragment", "//slskd",
+])
+def test_slskd_rejects_non_origin_configuration(url):
+    with pytest.raises(ValueError, match="invalid slskd origin"):
+        SlskdDiscoveryClient(url, "secret")
+
+
+def test_slskd_rejects_redirect_final_origin_without_leaking_key():
+    class Session:
+        def get(self, url, **kwargs):
+            return Response({}, url="http://attacker.invalid/api/v0/application")
+    client = SlskdDiscoveryClient("http://slskd:5030", "top-secret", session=Session())
+    assert client.health() == {"state": "unavailable", "error": "slskd_unavailable"}
 
 
 def test_slskd_errors_are_sanitized_and_health_is_safe():
@@ -128,7 +166,8 @@ def test_http_conflict_provider_is_bounded_runtime_config_and_sanitizes_failure(
     class Session:
         def get(self, url, **kwargs):
             calls.append((url, kwargs))
-            return Response({"soularr": "idle", "lidarr": "clear"})
+            return Response({"soularr": "idle", "lidarr": "clear"},
+                            url="http://conflict-state.local/check?track_id=7&album_id=3")
 
     provider = HttpConflictStateProvider(
         "http://conflict-state.local/check", "runtime-token", session=Session(), timeout=(1, 2)
@@ -137,6 +176,7 @@ def test_http_conflict_provider_is_bounded_runtime_config_and_sanitizes_failure(
     assert calls == [("http://conflict-state.local/check", {
         "params": {"track_id": 7, "album_id": 3},
         "headers": {"Authorization": "Bearer runtime-token"}, "timeout": (1, 2),
+        "allow_redirects": False,
     })]
 
     class Broken:
@@ -146,3 +186,37 @@ def test_http_conflict_provider_is_bounded_runtime_config_and_sanitizes_failure(
     with pytest.raises(ConflictStateUnavailable, match="conflict_state_unavailable") as error:
         HttpConflictStateProvider("http://private", "secret", session=Broken()).conflict_state(7)
     assert "secret" not in str(error.value)
+
+
+def test_http_conflict_endpoint_is_strict_and_redirects_are_rejected():
+    for endpoint in ("https://u:p@state/check", "https://state/check?q=x", "file:///tmp/x"):
+        with pytest.raises(ValueError, match="invalid conflict endpoint"):
+            HttpConflictStateProvider(endpoint, "secret")
+    class Redirected:
+        def get(self, url, **kwargs):
+            assert kwargs["allow_redirects"] is False
+            return Response({"soularr": "idle", "lidarr": "clear"}, url="https://evil/check")
+    with pytest.raises(ConflictStateUnavailable):
+        HttpConflictStateProvider("https://state/check", "secret", session=Redirected()).conflict_state(1)
+
+
+def test_production_conflict_provider_uses_lidarr_queue_and_local_acknowledgement(tmp_path):
+    from smart_lidatube.store import Store
+    store = Store(tmp_path / "db")
+    job = store.enqueue_job(7, "manual", mode="manual", metadata={"playlist_name": "Manual Retry"})
+    store.claim_job(300)
+    class Lidarr:
+        def queue_records(self):
+            return [{"trackId": 8, "albumId": 3}]
+    soularr = LocalSoularrStateAdapter(store, coexistence_mode="manual-retry-only")
+    provider = ProductionConflictStateProvider(Lidarr(), soularr)
+    assert provider.conflict_state(7, album_id=2) == {
+        "soularr": "manual_retry_only", "lidarr": "clear"}
+    assert provider.conflict_state(7, album_id=3)["lidarr"] == "queued"
+    assert store.get_job(job)["status"] == "processing"
+
+
+def test_local_soularr_adapter_fails_closed_without_explicit_ack(tmp_path):
+    from smart_lidatube.store import Store
+    adapter = LocalSoularrStateAdapter(Store(tmp_path / "db"), coexistence_mode="")
+    assert adapter.state(7) == "unknown"

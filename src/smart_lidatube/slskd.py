@@ -6,8 +6,40 @@ import hashlib
 import hmac
 import time
 from typing import Protocol
+from urllib.parse import urlsplit
 
 import requests
+
+
+def _origin(url, *, label, require_root=False):
+    """Validate an HTTP(S) URL and return its immutable scheme/host origin."""
+    parsed = urlsplit(str(url))
+    invalid = (
+        parsed.scheme not in {"http", "https"} or not parsed.netloc
+        or parsed.username is not None or parsed.password is not None
+        or bool(parsed.query) or bool(parsed.fragment)
+        or (require_root and parsed.path not in {"", "/"})
+    )
+    try:
+        port = parsed.port
+    except ValueError:
+        invalid = True
+        port = None
+    if invalid:
+        raise ValueError(f"invalid {label}")
+    host = parsed.hostname
+    default = (parsed.scheme == "http" and port in {None, 80}) or (
+        parsed.scheme == "https" and port in {None, 443}
+    )
+    return f"{parsed.scheme}://{host}" + ("" if default else f":{port}")
+
+
+def _same_origin(response, expected, requested):
+    final_url = getattr(response, "url", None) or requested
+    parsed = urlsplit(str(final_url))
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    return _origin(f"{parsed.scheme}://{parsed.netloc}", label="response URL") == expected
 
 
 class SlskdDiscoveryError(RuntimeError):
@@ -31,6 +63,7 @@ class HttpConflictStateProvider:
 
     def __init__(self, endpoint, token, *, session=requests, timeout=(2, 5)):
         self.endpoint = str(endpoint)
+        self.origin = _origin(self.endpoint, label="conflict endpoint")
         self.headers = {"Authorization": f"Bearer {token}"}
         self.session = session
         self.timeout = timeout
@@ -41,18 +74,53 @@ class HttpConflictStateProvider:
             params["album_id"] = album_id
         try:
             response = self.session.get(
-                self.endpoint, params=params, headers=self.headers, timeout=self.timeout
+                self.endpoint, params=params, headers=self.headers, timeout=self.timeout,
+                allow_redirects=False,
             )
+            if not _same_origin(response, self.origin, self.endpoint):
+                raise ValueError("response origin changed")
             response.raise_for_status()
             return response.json()
         except Exception:
             raise ConflictStateUnavailable("conflict_state_unavailable") from None
 
 
+class LocalSoularrStateAdapter:
+    """Conservative local ownership adapter; it never claims Soularr is idle."""
+
+    def __init__(self, store, coexistence_mode=""):
+        self.store = store
+        self.coexistence_mode = str(coexistence_mode or "").casefold()
+
+    def state(self, track_id, album_id=None):
+        if self.coexistence_mode != "manual-retry-only":
+            return "unknown"
+        jobs = self.store.list_jobs_for_track(track_id)
+        active = {"queued", "processing", "awaiting_review", "notification_pending"}
+        return "manual_retry_only" if any(job["status"] in active for job in jobs) else "unknown"
+
+
+class ProductionConflictStateProvider:
+    """Combine supported Lidarr queue facts with conservative Soularr state."""
+
+    def __init__(self, lidarr, soularr):
+        self.lidarr = lidarr
+        self.soularr = soularr
+
+    def conflict_state(self, track_id, album_id=None):
+        conflict = any(
+            item.get("trackId") == track_id
+            or (album_id is not None and item.get("albumId") == album_id)
+            for item in self.lidarr.queue_records()
+        )
+        return {"soularr": self.soularr.state(track_id, album_id),
+                "lidarr": "queued" if conflict else "clear"}
+
+
 class SoularrLidarrConflictGuard:
     """Require explicit idle state from Soularr and Lidarr before source work."""
 
-    CLEAR_STATES = {"idle", "clear", "completed", "not_wanted"}
+    CLEAR_STATES = {"idle", "clear", "completed", "not_wanted", "manual_retry_only"}
     ACTIVE_STATES = {"wanted", "downloading", "importing", "active", "queued"}
 
     def __init__(self, state_provider: ConflictStateProvider):
@@ -102,9 +170,13 @@ class ReviewGatedDiscoverySources:
             self._slskd_block = type(exc).__name__
             return youtube
         self._slskd_block = None
-        discovered = self.slskd.search(
-            identity["artist"], identity["title"], album=identity.get("album")
-        )
+        try:
+            discovered = self.slskd.search(
+                identity["artist"], identity["title"], album=identity.get("album")
+            )
+        except SlskdDiscoveryError:
+            self._slskd_block = "SlskdDiscoveryError"
+            return youtube
         return discovered + youtube
 
     def search(self, artist, title):
@@ -119,12 +191,15 @@ class ReviewGatedDiscoverySources:
     def health(self):
         slskd = self.slskd.health()
         if self._slskd_block:
-            error = (
-                "conflict_state_unavailable"
-                if self._slskd_block == "ConflictStateUnavailable"
-                else "active_manager_conflict"
-            )
-            slskd = {"state": "blocked", "error": error}
+            if self._slskd_block == "SlskdDiscoveryError":
+                slskd = {"state": "degraded", "error": "slskd_search_failed"}
+            else:
+                error = (
+                    "conflict_state_unavailable"
+                    if self._slskd_block == "ConflictStateUnavailable"
+                    else "active_manager_conflict"
+                )
+                slskd = {"state": "blocked", "error": error}
         return {
             "youtube": {"state": "available", "error": None},
             "slskd": slskd,
@@ -140,7 +215,7 @@ class SlskdDiscoveryClient:
         self, base_url, api_key, *, session=requests, timeout=(2, 5), result_cap=20,
         poll_attempts=3, poll_interval=0.2, opaque_key=None,
     ):
-        self.base = str(base_url).rstrip("/")
+        self.base = _origin(base_url, label="slskd origin", require_root=True)
         self.headers = {"X-API-Key": api_key}
         self.session = session
         self.timeout = timeout
@@ -155,20 +230,27 @@ class SlskdDiscoveryClient:
         cap = min(self.result_cap, max(1, int(limit or self.result_cap)))
         query = " ".join(part for part in (f"{artist} - {title}", album) if part)
         try:
+            post_url = f"{self.base}/api/v0/searches"
             response = self.session.post(
-                f"{self.base}/api/v0/searches", json={"searchText": query},
-                headers=self.headers, timeout=self.timeout,
+                post_url, json={"searchText": query, "responseLimit": cap,
+                                "fileLimit": cap, "minimumResponseFileCount": 1},
+                headers=self.headers, timeout=self.timeout, allow_redirects=False,
             )
+            if not _same_origin(response, self.base, post_url):
+                raise ValueError("response origin changed")
             response.raise_for_status()
             search_id = response.json().get("id")
             if not search_id:
                 raise ValueError("missing search id")
             payload = None
             for attempt in range(self.poll_attempts):
+                get_url = f"{self.base}/api/v0/searches/{search_id}"
                 result = self.session.get(
-                    f"{self.base}/api/v0/searches/{search_id}",
-                    headers=self.headers, timeout=self.timeout,
+                    get_url, params={"includeResponses": "true"},
+                    headers=self.headers, timeout=self.timeout, allow_redirects=False,
                 )
+                if not _same_origin(result, self.base, get_url):
+                    raise ValueError("response origin changed")
                 result.raise_for_status()
                 payload = result.json()
                 if str(payload.get("state", "")).casefold() in {"completed", "complete"}:
@@ -181,10 +263,12 @@ class SlskdDiscoveryClient:
 
     def health(self):
         try:
+            url = f"{self.base}/api/v0/application"
             response = self.session.get(
-                f"{self.base}/api/v0/application", headers=self.headers,
-                timeout=self.timeout,
+                url, headers=self.headers, timeout=self.timeout, allow_redirects=False,
             )
+            if not _same_origin(response, self.base, url):
+                raise ValueError("response origin changed")
             response.raise_for_status()
             return {"state": "available", "error": None}
         except Exception:
@@ -192,14 +276,13 @@ class SlskdDiscoveryClient:
 
     def _safe_results(self, payload, artist, title, album, cap):
         output = []
-        for peer_index, response in enumerate(payload.get("responses") or []):
-            for file_index, item in enumerate(response.get("files") or []):
+        for response in payload.get("responses") or []:
+            for item in response.get("files") or []:
                 filename = str(item.get("filename") or item.get("path") or "")
                 codec = filename.rsplit(".", 1)[-1].casefold() if "." in filename else None
-                source_material = "\0".join((
-                    str(payload.get("id") or ""), str(response.get("username") or peer_index),
-                    filename or str(file_index), str(item.get("size") or ""),
-                )).encode()
+                peer = " ".join(str(response.get("username") or "").split()).casefold()
+                path = filename.replace("\\", "/").casefold()
+                source_material = "\0".join((peer, path, str(item.get("size") or ""))).encode()
                 source_id = "slskd:" + hmac.new(
                     self.opaque_key, source_material, hashlib.sha256
                 ).hexdigest()[:32]

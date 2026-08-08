@@ -100,6 +100,14 @@ Set `NAVIDROME_MUSIC_ROOT` and `LIDARR_MUSIC_ROOT` when their library mount root
 
 Uppercase smart variables and lowercase legacy Lidarr variables are accepted by the sidecar. This MVP is covered by mocked behavioral/integration tests and a container health smoke test where Docker is available.
 
+Optional slskd discovery is metadata-only and restricted to the `Manual Retry`
+playlist. Soularr's current surface does not expose a trustworthy idle/work-state
+route, so Smart LidaTube cannot prove Soularr idle. Accordingly, slskd remains
+disabled unless `SMART_SOULARR_COEXISTENCE_MODE=manual-retry-only` explicitly
+acknowledges this limitation. In that mode Smart LidaTube uses its durable
+track-scoped job as a local ownership marker and also checks Lidarr's supported
+queue API; it never represents the acknowledgement as proof that Soularr is idle.
+
 ### Library integrity auditor (read-only)
 
 The smart worker also contains a conservative library auditor. It records a separate SQLite ledger and uses Lidarr's current track-file resolution plus the existing `FileVerifier`/fpcalc/AcoustID path to classify an organized file as `verified`, `likely_correct`, `suspect`, `unverifiable`, or `unavailable`. It does **not** search YouTube, download media, create retry jobs, send remediation prompts, call a Lidarr import command, or change library files.

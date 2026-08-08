@@ -65,6 +65,18 @@ def test_router_fails_closed_by_skipping_slskd_when_conflict_state_unavailable()
     assert router.health()["slskd"] == {"state": "blocked", "error": "conflict_state_unavailable"}
 
 
+def test_router_falls_back_to_already_fetched_youtube_when_slskd_search_fails():
+    class BrokenSlskd(Slskd):
+        def search(self, *args, **kwargs):
+            from smart_lidatube.slskd import SlskdDiscoveryError
+            raise SlskdDiscoveryError("slskd search unavailable")
+    router = ReviewGatedDiscoverySources(YouTube(), BrokenSlskd(), SoularrLidarrConflictGuard(ClearState()))
+    job = {"lidarr_track_id": 7, "mode": "manual", "metadata": {"playlist_name": "Manual Retry"}}
+    assert router.search_for_job(job, {"artist": "A", "title": "T"}) == [
+        {"provider": "youtube", "source_id": "yt"}]
+    assert router.health()["slskd"] == {"state": "degraded", "error": "slskd_search_failed"}
+
+
 def test_worker_persists_slskd_metadata_for_review_without_download_or_verification(tmp_path):
     store = Store(tmp_path / "db")
     job_id = store.enqueue_job(7, "manual", mode="manual", metadata={"playlist_name": "Manual Retry"})
@@ -137,17 +149,42 @@ def test_authenticated_status_aggregates_safe_source_health(tmp_path):
     assert "http" not in str(body) and "secret" not in str(body)
 
 
-def test_runtime_source_builder_enables_slskd_only_with_all_guard_configuration():
+def test_runtime_source_builder_requires_manual_retry_ack_and_uses_production_guard(tmp_path):
     youtube = object()
     values = {
         "SLSKD_URL": "http://192.168.50.166:5030", "SLSKD_API_KEY": "runtime-key",
-        "SMART_CONFLICT_STATE_URL": "http://state/check",
-        "SMART_CONFLICT_STATE_TOKEN": "runtime-token", "SLSKD_RESULT_CAP": "7",
+        "SMART_SOULARR_COEXISTENCE_MODE": "manual-retry-only",
+        "SMART_DB_PATH": str(tmp_path / "db"), "SLSKD_RESULT_CAP": "7",
+        "LIDARR_ADDRESS": "http://lidarr:8686", "LIDARR_API_KEY": "lidarr-key",
     }
     source = build_discovery_source(youtube, values.get)
     assert isinstance(source, ReviewGatedDiscoverySources)
     assert source.slskd.base == "http://192.168.50.166:5030"
     assert source.slskd.result_cap == 7
 
-    values.pop("SMART_CONFLICT_STATE_TOKEN")
+    values.pop("SMART_SOULARR_COEXISTENCE_MODE")
     assert build_discovery_source(youtube, values.get) is youtube
+
+
+def test_runtime_status_provider_reports_disabled_empty_slskd_configuration():
+    from smart_lidatube.runner import build_source_status
+    health = build_source_status({}.get).health()
+    assert health["slskd"] == {"state": "disabled", "error": "not_configured"}
+
+
+def test_runtime_status_provider_checks_configured_slskd_safely():
+    from smart_lidatube.runner import build_source_status
+    values = {"SLSKD_URL": "http://slskd:5030", "SLSKD_API_KEY": "key",
+              "SMART_SOULARR_COEXISTENCE_MODE": "manual-retry-only"}
+    class Session:
+        def get(self, url, **kwargs):
+            return type("R", (), {"url": url, "raise_for_status": lambda self: None})()
+    status = build_source_status(values.get, session=Session()).health()
+    assert status["slskd"] == {"state": "available", "error": None}
+
+
+def test_production_flask_entrypoint_wires_runtime_source_status():
+    from pathlib import Path
+    text = (Path(__file__).parents[1] / "src" / "LidaTube.py").read_text()
+    assert "from smart_lidatube.runner import build_source_status" in text
+    assert "source_health=build_source_status()" in text

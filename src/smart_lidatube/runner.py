@@ -17,7 +17,8 @@ from smart_lidatube.store import Store
 from smart_lidatube.telegram import TelegramBot
 from smart_lidatube.worker import JobWorker
 from smart_lidatube.slskd import (
-    HttpConflictStateProvider,
+    LocalSoularrStateAdapter,
+    ProductionConflictStateProvider,
     ReviewGatedDiscoverySources,
     SlskdDiscoveryClient,
     SoularrLidarrConflictGuard,
@@ -43,32 +44,63 @@ def csv_ints(value):
     return {int(item.strip()) for item in value.split(",") if item.strip()}
 
 
-def build_discovery_source(youtube, getenv=env):
-    """Enable slskd only when discovery and fail-closed guard are configured."""
-    slskd_url = getenv("SLSKD_URL") or ""
-    slskd_key = getenv("SLSKD_API_KEY") or ""
-    state_url = getenv("SMART_CONFLICT_STATE_URL") or ""
-    state_token = getenv("SMART_CONFLICT_STATE_TOKEN") or ""
-    if not all((slskd_url, slskd_key, state_url, state_token)):
-        return youtube
-    slskd = SlskdDiscoveryClient(
-        slskd_url,
-        slskd_key,
-        timeout=(
-            float(getenv("SLSKD_CONNECT_TIMEOUT") or "2"),
-            float(getenv("SLSKD_READ_TIMEOUT") or "5"),
-        ),
+def _lidarr_from_config(getenv):
+    return LidarrClient(
+        getenv("LIDARR_ADDRESS") or "http://lidarr:8686",
+        getenv("LIDARR_API_KEY") or "",
+        timeout=float(getenv("LIDARR_API_TIMEOUT") or "30"),
+    )
+
+
+def _slskd_from_config(getenv, **kwargs):
+    return SlskdDiscoveryClient(
+        getenv("SLSKD_URL") or "", getenv("SLSKD_API_KEY") or "",
+        timeout=(float(getenv("SLSKD_CONNECT_TIMEOUT") or "2"),
+                 float(getenv("SLSKD_READ_TIMEOUT") or "5")),
         result_cap=int(getenv("SLSKD_RESULT_CAP") or "20"),
         poll_attempts=int(getenv("SLSKD_POLL_ATTEMPTS") or "3"),
-        opaque_key=getenv("SLSKD_OPAQUE_ID_KEY") or slskd_key,
+        opaque_key=getenv("SLSKD_OPAQUE_ID_KEY") or getenv("SLSKD_API_KEY"),
+        **kwargs,
     )
-    conflict = HttpConflictStateProvider(
-        state_url,
-        state_token,
-        timeout=(
-            float(getenv("SMART_CONFLICT_CONNECT_TIMEOUT") or "2"),
-            float(getenv("SMART_CONFLICT_READ_TIMEOUT") or "5"),
-        ),
+
+
+class RuntimeSourceStatus:
+    def __init__(self, slskd=None, enabled=False):
+        self.slskd = slskd
+        self.enabled = enabled
+
+    def health(self):
+        state = (self.slskd.health() if self.slskd else
+                 {"state": "disabled", "error": "not_configured"})
+        if self.slskd and not self.enabled:
+            state = {"state": "disabled", "error": "coexistence_not_acknowledged"}
+        return {"youtube": {"state": "available", "error": None}, "slskd": state}
+
+
+def build_source_status(getenv=env, *, session=None):
+    url, key = getenv("SLSKD_URL") or "", getenv("SLSKD_API_KEY") or ""
+    if not url or not key:
+        return RuntimeSourceStatus()
+    options = {"session": session} if session is not None else {}
+    try:
+        client = _slskd_from_config(getenv, **options)
+    except (ValueError, TypeError):
+        return RuntimeSourceStatus()
+    acknowledged = getenv("SMART_SOULARR_COEXISTENCE_MODE") == "manual-retry-only"
+    return RuntimeSourceStatus(client, acknowledged)
+
+
+def build_discovery_source(youtube, getenv=env, *, store=None, lidarr=None):
+    """Enable slskd only with explicit conservative Soularr acknowledgement."""
+    slskd_url = getenv("SLSKD_URL") or ""
+    slskd_key = getenv("SLSKD_API_KEY") or ""
+    coexistence = getenv("SMART_SOULARR_COEXISTENCE_MODE") or ""
+    if not all((slskd_url, slskd_key)) or coexistence != "manual-retry-only":
+        return youtube
+    slskd = _slskd_from_config(getenv)
+    store = store or Store(getenv("SMART_DB_PATH") or "/lidatube/config/smart-lidatube.db")
+    conflict = ProductionConflictStateProvider(
+        lidarr or _lidarr_from_config(getenv), LocalSoularrStateAdapter(store, coexistence)
     )
     return ReviewGatedDiscoverySources(
         youtube, slskd, SoularrLidarrConflictGuard(conflict)
@@ -97,7 +129,7 @@ def build_components():
     acoustid_key = env("ACOUSTID_API_KEY")
     verifier = FileVerifier(Fpcalc(), AcoustIDClient(acoustid_key))
     source = build_discovery_source(
-        YouTubeClient(cookies=env("YTDLP_COOKIES", "") or None)
+        YouTubeClient(cookies=env("YTDLP_COOKIES", "") or None), store=store, lidarr=lidarr
     )
     worker = JobWorker(
         store,
