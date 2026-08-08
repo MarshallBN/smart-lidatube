@@ -187,9 +187,13 @@ class JobWorker:
                 identity["current_track_file_error"] = str(exc)
         audit_origin = is_audit_origin(job)
         current_quality = self._current_quality(identity, job["lidarr_track_id"])
+        search_for_job = getattr(self.sources, "search_for_job", None)
+        discovered = (
+            search_for_job(job, identity) if search_for_job
+            else self.sources.search(identity["artist"], identity["title"])
+        )
         candidates = filter_candidates(
-            self.store, job["lidarr_track_id"],
-            self.sources.search(identity["artist"], identity["title"]),
+            self.store, job["lidarr_track_id"], discovered,
         )
         for candidate in candidates:
             attempt_id = self.store.add_attempt(
@@ -198,6 +202,12 @@ class JobWorker:
             attempt = self.store.get_attempt(attempt_id)
             if attempt["verdict"] in {"rejected", "manual_rejected"}:
                 continue
+            if candidate["provider"] == "slskd":
+                # Discovery milestone: metadata enters the existing API review
+                # queue, but no file is requested, staged, verified or imported.
+                self.store.update_attempt(attempt_id, verdict="awaiting_review")
+                self.store.update_job(job["id"], "awaiting_review")
+                return
             try:
                 staged = self.sources.download(
                     candidate, self.downloads_root / ".smart-staging" / str(job["id"])

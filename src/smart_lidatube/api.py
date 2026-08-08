@@ -11,7 +11,7 @@ SAFE_AUDIT_REQUEUE_STATUSES = {"unavailable", "unverifiable"}
 MAX_AUDIT_REQUEUE_LIMIT = 200
 
 
-def register_api(app, store, token):
+def register_api(app, store, token, source_health=None):
     def auth(function):
         @wraps(function)
         def wrapped(*args, **kwargs):
@@ -111,6 +111,8 @@ def register_api(app, store, token):
         action = (request.get_json(silent=True) or {}).get("action")
         if action not in {"accept", "reject", "cancel", "ignore_track", "audit_later"}:
             return jsonify(error="invalid review action"), 400
+        if action == "accept" and store.review_provider(attempt_id) == "slskd":
+            return jsonify(error="slskd acquisition is not enabled"), 409
         if store.review_is_audit_origin(attempt_id):
             result = store.apply_audit_review(attempt_id, action, {"api_review": True})
         elif action in {"accept", "reject", "cancel"}:
@@ -204,8 +206,17 @@ function connect(){token=prompt('API token')||'';load('dashboard','/api/smart/da
     def health():
         return jsonify(status="ok")
 
+    @app.get("/api/smart/status")
+    @auth
+    def status():
+        sources = source_health.health() if source_health else {}
+        aggregate = "ok" if all(
+            value.get("state") == "available" for value in sources.values()
+        ) else "degraded"
+        return jsonify(status=aggregate, sources=sources)
+
     return app
 
 
-def create_api(store, token):
-    return register_api(Flask(__name__), store, token)
+def create_api(store, token, source_health=None):
+    return register_api(Flask(__name__), store, token, source_health=source_health)

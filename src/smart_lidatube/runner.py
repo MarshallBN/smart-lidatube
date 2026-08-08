@@ -16,6 +16,12 @@ from smart_lidatube.quality import FFprobe
 from smart_lidatube.store import Store
 from smart_lidatube.telegram import TelegramBot
 from smart_lidatube.worker import JobWorker
+from smart_lidatube.slskd import (
+    HttpConflictStateProvider,
+    ReviewGatedDiscoverySources,
+    SlskdDiscoveryClient,
+    SoularrLidarrConflictGuard,
+)
 
 
 LOGGER = logging.getLogger("smart-lidatube-worker")
@@ -35,6 +41,38 @@ def env(name, default="", legacy=None):
 
 def csv_ints(value):
     return {int(item.strip()) for item in value.split(",") if item.strip()}
+
+
+def build_discovery_source(youtube, getenv=env):
+    """Enable slskd only when discovery and fail-closed guard are configured."""
+    slskd_url = getenv("SLSKD_URL") or ""
+    slskd_key = getenv("SLSKD_API_KEY") or ""
+    state_url = getenv("SMART_CONFLICT_STATE_URL") or ""
+    state_token = getenv("SMART_CONFLICT_STATE_TOKEN") or ""
+    if not all((slskd_url, slskd_key, state_url, state_token)):
+        return youtube
+    slskd = SlskdDiscoveryClient(
+        slskd_url,
+        slskd_key,
+        timeout=(
+            float(getenv("SLSKD_CONNECT_TIMEOUT") or "2"),
+            float(getenv("SLSKD_READ_TIMEOUT") or "5"),
+        ),
+        result_cap=int(getenv("SLSKD_RESULT_CAP") or "20"),
+        poll_attempts=int(getenv("SLSKD_POLL_ATTEMPTS") or "3"),
+        opaque_key=getenv("SLSKD_OPAQUE_ID_KEY") or slskd_key,
+    )
+    conflict = HttpConflictStateProvider(
+        state_url,
+        state_token,
+        timeout=(
+            float(getenv("SMART_CONFLICT_CONNECT_TIMEOUT") or "2"),
+            float(getenv("SMART_CONFLICT_READ_TIMEOUT") or "5"),
+        ),
+    )
+    return ReviewGatedDiscoverySources(
+        youtube, slskd, SoularrLidarrConflictGuard(conflict)
+    )
 
 
 def build_components():
@@ -58,7 +96,9 @@ def build_components():
         )
     acoustid_key = env("ACOUSTID_API_KEY")
     verifier = FileVerifier(Fpcalc(), AcoustIDClient(acoustid_key))
-    source = YouTubeClient(cookies=env("YTDLP_COOKIES", "") or None)
+    source = build_discovery_source(
+        YouTubeClient(cookies=env("YTDLP_COOKIES", "") or None)
+    )
     worker = JobWorker(
         store,
         lidarr,

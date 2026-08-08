@@ -482,19 +482,38 @@ class Store:
             return c.execute("""SELECT 1 FROM source_attempts a JOIN retry_jobs j ON j.id=a.job_id
                 WHERE a.id=? AND a.verdict='awaiting_review' AND j.status='awaiting_review' AND """
                 + AUDIT_ORIGIN_SQL, (attempt_id,)).fetchone() is not None
+    def review_provider(self, attempt_id):
+        with self._connect() as c:
+            row = c.execute("""SELECT a.provider FROM source_attempts a
+                JOIN retry_jobs j ON j.id=a.job_id WHERE a.id=?
+                AND a.verdict='awaiting_review' AND j.status='awaiting_review'""",
+                (attempt_id,)).fetchone()
+        return row["provider"] if row else None
     def list_safe_reviews(self, cursor, limit):
         updated_at, cursor_id = self._decode_review_cursor(cursor)
         with self._connect() as c:
-            rows = c.execute("""SELECT a.id,j.id job_id,j.lidarr_track_id,j.mode,j.metadata,a.created_at,a.updated_at,
-                CASE WHEN """ + AUDIT_ORIGIN_SQL + """ THEN 1 ELSE 0 END audit_origin
+            rows = c.execute("""SELECT a.id,j.id job_id,j.lidarr_track_id,j.mode,j.metadata,a.provider,a.provenance,
+                a.created_at,a.updated_at, CASE WHEN """ + AUDIT_ORIGIN_SQL + """ THEN 1 ELSE 0 END audit_origin
                 FROM source_attempts a JOIN retry_jobs j ON j.id=a.job_id
                 WHERE a.verdict='awaiting_review' AND j.status='awaiting_review'
                 AND (a.updated_at>? OR (a.updated_at=? AND a.id>?))
                 ORDER BY a.updated_at,a.id LIMIT ?""", (updated_at, updated_at, cursor_id, limit)).fetchall()
-        items = [{"attempt_id": row["id"], "job_id": f"job:{row['job_id']}",
-                 "track_id": f"track:{row['lidarr_track_id']}", "mode": row["mode"],
-                 "audit_origin": bool(row["audit_origin"]),
-                 "created_at": row["created_at"]} for row in rows]
+        items = []
+        safe_candidate_fields = {
+            "provider", "source_id", "artist", "title", "album", "codec", "bitrate",
+            "sample_rate", "bit_depth", "size_band", "duration",
+        }
+        for row in rows:
+            item = {"attempt_id": row["id"], "job_id": f"job:{row['job_id']}",
+                    "track_id": f"track:{row['lidarr_track_id']}", "mode": row["mode"],
+                    "audit_origin": bool(row["audit_origin"]), "created_at": row["created_at"]}
+            if row["provider"] == "slskd":
+                provenance = json.loads(row["provenance"])
+                item["candidate"] = {
+                    key: value for key, value in provenance.items()
+                    if key in safe_candidate_fields
+                }
+            items.append(item)
         next_cursor = self._review_cursor(rows[-1]["updated_at"], rows[-1]["id"]) if rows else cursor
         return items, next_cursor
     def set_audit_bootstrap_state(self, status, error, count, cursor):
