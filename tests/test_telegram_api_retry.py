@@ -284,3 +284,60 @@ def test_retry_import_api_only_recovers_prepared_import_without_submission(tmp_p
     store.update_job(unknown, "import_attention", "outcome unknown")
     assert client.post(f"/api/smart/jobs/{unknown}/retry-import", headers=headers).status_code == 409
     assert client.post(f"/api/smart/jobs/{job}/retry-import").status_code == 401
+
+
+def test_callback_unauthorized_press_is_answered(tmp_path):
+    """A press from a user outside the allowlist must be acknowledged, not silent."""
+    s=Store(tmp_path/"x.db"); j=s.enqueue_job(1,"x"); a=s.add_attempt(j,"youtube","abc")
+    s.update_attempt(a, verdict="awaiting_review"); s.update_job(j, "awaiting_review")
+    sent=[]
+    bot=TelegramBot("token", s, allowed_users={5}, allowed_chats={9}, request=lambda method,payload: sent.append((method,payload)) or {})
+    assert bot.handle_callback({"id":"c","from":{"id":666},"message":{"chat":{"id":9},"message_id":3,"text":"review"},"data":f"attempt:{a}:accept"}) is False
+    acks=[p for m,p in sent if m=="answerCallbackQuery"]
+    assert acks and "Not authorized" in acks[0]["text"]
+    assert not [m for m,_ in sent if m=="editMessageText"]
+
+
+def test_callback_accept_edits_message_and_answers(tmp_path):
+    """A successful accept must update the review message and acknowledge the press."""
+    s=Store(tmp_path/"x.db"); j=s.enqueue_job(1,"x"); a=s.add_attempt(j,"youtube","abc")
+    s.update_attempt(a, verdict="awaiting_review"); s.update_job(j, "awaiting_review")
+    sent=[]
+    bot=TelegramBot("token", s, allowed_users={5}, allowed_chats={9}, request=lambda method,payload: sent.append((method,payload)) or {})
+    q={"id":"c","from":{"id":5},"message":{"chat":{"id":9},"message_id":7,"text":"Smart retry job 1\nJustTrae - Hands Up\nVerification: inconclusive (no_match)"},"data":f"attempt:{a}:accept"}
+    assert bot.handle_callback(q) is True
+    edits=[(m,p) for m,p in sent if m=="editMessageText"]
+    assert edits, "review message must be edited on accept"
+    _, ep = edits[0]
+    assert ep["message_id"]==7 and ep["text"].startswith("Smart retry job 1")
+    assert "Accepted" in ep["text"] and ep["reply_markup"]=={"inline_keyboard":[]}
+    acks=[p for m,p in sent if m=="answerCallbackQuery"]
+    assert acks and "Accepted" in acks[0]["text"]
+
+
+def test_callback_stale_press_edits_and_answers(tmp_path):
+    """A press on an already-actioned attempt must visibly say so."""
+    s=Store(tmp_path/"x.db"); j=s.enqueue_job(1,"x"); a=s.add_attempt(j,"youtube","abc")
+    s.update_attempt(a, verdict="awaiting_review"); s.update_job(j, "awaiting_review")
+    sent=[]
+    bot=TelegramBot("token", s, allowed_users={5}, allowed_chats={9}, request=lambda method,payload: sent.append((method,payload)) or {})
+    q={"id":"c","from":{"id":5},"message":{"chat":{"id":9},"message_id":7,"text":"review"},"data":f"attempt:{a}:accept"}
+    assert bot.handle_callback(q) is True
+    sent.clear()
+    assert bot.handle_callback(q) is False
+    acks=[p for m,p in sent if m=="answerCallbackQuery"]
+    assert acks and "stale" in acks[0]["text"].lower()
+    assert [m for m,_ in sent if m=="editMessageText"], "stale outcome must be visible on the message"
+
+
+def test_callback_policy_error_is_answered_and_recorded(tmp_path):
+    """Accept on an slskd candidate must tell the user the action is unavailable."""
+    s=Store(tmp_path/"x.db"); j=s.enqueue_job(1,"x"); a=s.add_attempt(j,"slskd","abc")
+    s.update_attempt(a, verdict="awaiting_review"); s.update_job(j, "awaiting_review")
+    sent=[]
+    bot=TelegramBot("token", s, allowed_users={5}, allowed_chats={9}, request=lambda method,payload: sent.append((method,payload)) or {})
+    q={"id":"c","from":{"id":5},"message":{"chat":{"id":9},"message_id":7,"text":"review"},"data":f"attempt:{a}:accept"}
+    assert bot.handle_callback(q) is False
+    acks=[p for m,p in sent if m=="answerCallbackQuery"]
+    assert acks and "not enabled" in acks[0]["text"]
+    assert [p for m,p in sent if m=="editMessageText"]

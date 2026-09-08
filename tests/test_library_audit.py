@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from smart_lidatube.audit import AuditConfig, AuditWorker, classify_verification, recheck_seconds
@@ -187,7 +187,7 @@ def test_daily_digest_dedupe_pagination_and_sanitization(tmp_path):
         store.record_audit_result(track, "suspect", {"artist": "A", "title": f"T{track}", "error": "https://x:token@y", "reason": "recording_mismatch"})
     sent = []
     bot = TelegramBot("token", store, {1}, {2}, request=lambda method, payload: sent.append((method, payload)) or {})
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).date().isoformat()
     assert bot.send_audit_digest(2, today) is True
     assert bot.send_audit_digest(2, today) is False
     payload = sent[0][1]

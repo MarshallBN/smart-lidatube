@@ -102,51 +102,97 @@ class TelegramBot:
         if page+1<pages: buttons.append({"text":"Next","callback_data":f"audit:{date}:{page+1}"})
         self.request("sendMessage", {"chat_id":chat_id,"text":"\n".join(lines),"reply_markup":{"inline_keyboard":[buttons]} if buttons else {}})
 
+    def _answer(self, query, text):
+        """Always acknowledge a callback so the client never spins silently."""
+        try:
+            self.request("answerCallbackQuery", {
+                "callback_query_id": query["id"], "text": str(text)[:200],
+            })
+        except Exception:
+            # Acknowledgement is best-effort; never break review handling on it.
+            pass
+
+    def _edit_review(self, query, outcome):
+        """Record the action on the review message itself so presses are visible."""
+        message = query.get("message") or {}
+        chat_id = (message.get("chat") or {}).get("id")
+        message_id = message.get("message_id")
+        text = message.get("text") or ""
+        if chat_id is None or message_id is None or not text:
+            return
+        try:
+            self.request("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": f"{text}\n\n— {outcome}",
+                "reply_markup": {"inline_keyboard": []},
+            })
+        except Exception:
+            # Message too old / not editable: the callback answer still gives feedback.
+            pass
+
     def handle_callback(self, query):
         user = int(query.get("from", {}).get("id", -1))
         chat = int(query.get("message", {}).get("chat", {}).get("id", -1))
         if user not in self.allowed_users or chat not in self.allowed_chats:
+            self._answer(query, "Not authorized for review actions.")
             return False
         try:
             prefix, raw_id, action = query["data"].split(":")
             if prefix == "audit":
                 page = int(action)
                 if page < 0:
+                    self._answer(query, "Already on the first page.")
                     return False
                 self._send_audit_page(chat, raw_id, page)
-                self.request("answerCallbackQuery", {"callback_query_id": query["id"], "text": "Audit details."})
+                self._answer(query, "Audit details.")
                 return True
             attempt_id = int(raw_id)
         except (KeyError, ValueError):
+            self._answer(query, "Unrecognized button.")
             return False
         if prefix != "attempt":
+            self._answer(query, "Unrecognized button.")
             return False
         evidence = {"telegram_user_id": user, "telegram_chat_id": chat}
         attempt = self.store.get_attempt(attempt_id)
-        job = self.store.get_job(attempt["job_id"]) if attempt else None
+        if attempt is None:
+            self._answer(query, "This review no longer exists.")
+            return False
+        job = self.store.get_job(attempt["job_id"])
         audit = is_audit_origin(job)
         policy_error = review_action_error(
             self.store.review_provider(attempt_id), action
         )
         if policy_error:
-            self.request("answerCallbackQuery", {
-                "callback_query_id": query["id"], "text": policy_error,
-            })
+            self._edit_review(query, f"Action unavailable: {policy_error}")
+            self._answer(query, policy_error)
             return False
         if audit:
             if action not in ("accept", "reject", "ignore_track", "audit_later"):
+                self._answer(query, "Action not available for this review.")
                 return False
             accepted = self.store.apply_audit_review(attempt_id, action, evidence)
         else:
             if action not in ("accept", "reject", "cancel"):
+                self._answer(query, "Action not available for this review.")
                 return False
             accepted = self.store.apply_review(attempt_id, action, evidence)
-        text = ("Review accepted." if accepted is not None else
-                "This review was already handled or is stale.")
-        self.request("answerCallbackQuery", {
-            "callback_query_id": query["id"], "text": text
-        })
-        return accepted is not None
+        if accepted is None:
+            outcome = "Already handled or stale"
+            self._edit_review(query, f"⊘ {outcome}")
+            self._answer(query, f"{outcome}.")
+            return False
+        outcome = {
+            "accept": "✓ Accepted — replacement will proceed",
+            "reject": "✓ Rejected",
+            "cancel": "✓ Job cancelled",
+            "ignore_track": "✓ Track ignored (do-not-upgrade set)",
+            "audit_later": "✓ Deferred — will recheck later",
+        }.get(action, f"✓ {action}")
+        self._edit_review(query, outcome)
+        self._answer(query, outcome)
+        return True
 
     def poll_once(self, offset=None):
         requested_offset = self.offset if offset is None else offset
